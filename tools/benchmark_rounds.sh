@@ -18,17 +18,15 @@ RUN_EXAMPLE="$PROJECT_ROOT/examples/scripts/run_example.py"
 # Each entry is just the directory name; kernels/ and golden.py are implied.
 # ---------------------------------------------------------------------------
 EXAMPLES=(
-    alternating_matmul_add
-    benchmark_bgemm
-    paged_attention_unroll
-    batch_paged_attention
     paged_attention
+    paged_attention_64bat_16h_128d_128bs
+    paged_attention_ptoas_64bat_16h_128d_128bs
 )
 
 # ---------------------------------------------------------------------------
 # Parse arguments
 # ---------------------------------------------------------------------------
-DEVICE_ID=0
+DEVICE_ID=12
 ROUNDS=10
 PLATFORM=a2a3
 EXTRA_ARGS=()
@@ -181,7 +179,11 @@ FAIL=0
 
 for example in "${EXAMPLES[@]}"; do
     EXAMPLE_DIR="$EXAMPLES_DIR/$example"
-    KERNELS_DIR="$EXAMPLE_DIR/kernels"
+    if [[ "$example" == "paged_attention" ]]; then
+        KERNELS_DIR="$EXAMPLE_DIR/kernels"
+    else
+        KERNELS_DIR="$EXAMPLE_DIR"
+    fi
     GOLDEN="$EXAMPLE_DIR/golden.py"
 
     echo ""

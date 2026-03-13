@@ -1,0 +1,11 @@
+module {
+  func.func @kernel_init_inplace(%arg0: !pto.ptr<f32>, %arg1: !pto.ptr<f32>, %arg2: !pto.ptr<f32>) {
+  %c16 = arith.constant 16 : index
+  %c128 = arith.constant 128 : index
+  %c1 = arith.constant 1 : index
+  %0 = pto.make_tensor_view %arg0, shape = [%c16, %c128], strides = [%c128, %c1] : !pto.tensor_view<?x?xf32>
+  %1 = pto.make_tensor_view %arg1, shape = [%c16, %c1], strides = [%c1, %c1] : !pto.tensor_view<?x?xf32>
+  %2 = pto.make_tensor_view %arg2, shape = [%c16, %c1], strides = [%c1, %c1] : !pto.tensor_view<?x?xf32>
+  return
+  }
+}

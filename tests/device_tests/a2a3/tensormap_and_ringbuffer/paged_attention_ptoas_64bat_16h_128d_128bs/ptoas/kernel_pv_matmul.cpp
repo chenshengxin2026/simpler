@@ -1,0 +1,52 @@
+#include "pto/pto-inst.hpp"
+using namespace pto;
+__global__ AICORE void kernel_pv_matmul(__gm__ bfloat16_t* v1, __gm__ bfloat16_t* v2, __gm__ float* v3) {
+  unsigned v4 = 16384;
+  unsigned v5 = 2048;
+  unsigned v6 = 128;
+  unsigned v7 = 16;
+  unsigned v8 = 1;
+  unsigned v9 = 0;
+  int32_t v10 = 1;
+  int32_t v11 = 128;
+  int32_t v12 = 16;
+  int64_t v13 = 0;
+  int64_t v14 = 4096;
+  using T = float;
+  Tile<TileType::Mat, bfloat16_t, 16, 128, BLayout::ColMajor, 16, 128, SLayout::RowMajor, 512, PadValue::Null> v15;
+  TASSIGN(v15, v13);
+  Tile<TileType::Mat, bfloat16_t, 128, 128, BLayout::ColMajor, 128, 128, SLayout::RowMajor, 512, PadValue::Null> v16;
+  TASSIGN(v16, v14);
+  Tile<TileType::Left, bfloat16_t, 16, 128, BLayout::ColMajor, 16, 128, SLayout::RowMajor, 512, PadValue::Null> v17;
+  TASSIGN(v17, v13);
+  Tile<TileType::Right, bfloat16_t, 128, 128, BLayout::RowMajor, 128, 128, SLayout::ColMajor, 512, PadValue::Null> v18;
+  TASSIGN(v18, v13);
+  Tile<TileType::Acc, float, 16, 128, BLayout::ColMajor, 16, 128, SLayout::RowMajor, 1024, PadValue::Null> v19;
+  TASSIGN(v19, v13);
+  pto::Shape<1, 1, 1, 16, 128> v20 = pto::Shape<1, 1, 1, 16, 128>();
+  pto::Stride<2048, 2048, 2048, 128, 1> v21 = pto::Stride<2048, 2048, 2048, 128, 1>();
+  GlobalTensor<bfloat16_t, pto::Shape<1, 1, 1, 16, 128>, pto::Stride<2048, 2048, 2048, 128, 1>, pto::Layout::ND> v22 = GlobalTensor<bfloat16_t, pto::Shape<1, 1, 1, 16, 128>, pto::Stride<2048, 2048, 2048, 128, 1>, pto::Layout::ND>(v1 + (v9 + v9 * (unsigned) v11 + v9 * (unsigned) v10), v20, v21);
+  TLOAD(v15, v22);
+  set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+  pto::Shape<1, 1, 1, 128, 128> v23 = pto::Shape<1, 1, 1, 128, 128>();
+  pto::Stride<16384, 16384, 16384, 128, 1> v24 = pto::Stride<16384, 16384, 16384, 128, 1>();
+  GlobalTensor<bfloat16_t, pto::Shape<1, 1, 1, 128, 128>, pto::Stride<16384, 16384, 16384, 128, 1>, pto::Layout::ND> v25 = GlobalTensor<bfloat16_t, pto::Shape<1, 1, 1, 128, 128>, pto::Stride<16384, 16384, 16384, 128, 1>, pto::Layout::ND>(v2 + (v9 + v9 * (unsigned) v11 + v9 * (unsigned) v10), v23, v24);
+  TLOAD(v16, v25);
+  set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);
+  wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+  TMOV(v17, v15);
+  wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);
+  TMOV(v18, v16);
+  set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+  wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+  TMATMUL(v19, v17, v18);
+  set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+  pto::Shape<1, 1, 1, 16, 128> v26 = pto::Shape<1, 1, 1, 16, 128>();
+  pto::Stride<2048, 2048, 2048, 128, 1> v27 = pto::Stride<2048, 2048, 2048, 128, 1>();
+  GlobalTensor<float, pto::Shape<1, 1, 1, 16, 128>, pto::Stride<2048, 2048, 2048, 128, 1>, pto::Layout::ND> v28 = GlobalTensor<float, pto::Shape<1, 1, 1, 16, 128>, pto::Stride<2048, 2048, 2048, 128, 1>, pto::Layout::ND>(v3 + (v9 + v9 * (unsigned) v11 + v9 * (unsigned) v10), v26, v27);
+  wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+  TSTORE(v28, v19);
+  pipe_barrier(PIPE_ALL);
+  return;
+}
+
