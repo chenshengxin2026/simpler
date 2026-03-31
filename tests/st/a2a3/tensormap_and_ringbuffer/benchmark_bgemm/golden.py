@@ -24,7 +24,7 @@ ATOL = 1e-3
 SUPPORTED_INCORE_DATA_SIZES = {16, 32, 64, 128}
 
 ALL_CASES = {
-    "Case0": {
+    "Case1": {
         "matmul_add_task_num": 500,
         "incore_task_granularity": {
             "incore_data_size": 128,
@@ -32,41 +32,73 @@ ALL_CASES = {
         },
         "grid_k": 2,
     },
-    "Case1": {
-        "matmul_add_task_num": 64,
-        "incore_task_granularity": {
-            "incore_data_size": 128,
-            "incore_loop": 4,
-        },
+    # --- Tile Size Sweep (fixed: num_groups=16, grid_k=2, incore_loop=4) ---
+    "Tile16": {
+        "matmul_add_task_num": 32,
+        "incore_task_granularity": {"incore_data_size": 16, "incore_loop": 4},
         "grid_k": 2,
     },
-    "Case2": {
-        "matmul_add_task_num": 256,
-        "incore_task_granularity": {
-            "incore_data_size": 128,
-            "incore_loop": 4,
-        },
+    "Tile32": {
+        "matmul_add_task_num": 32,
+        "incore_task_granularity": {"incore_data_size": 32, "incore_loop": 4},
         "grid_k": 2,
     },
-    "Case3": {
-        "matmul_add_task_num": 64,
-        "incore_task_granularity": {
-            "incore_data_size": 128,
-            "incore_loop": 16,
-        },
+    "Tile64": {
+        "matmul_add_task_num": 32,
+        "incore_task_granularity": {"incore_data_size": 64, "incore_loop": 4},
         "grid_k": 2,
     },
-    "Case4": {
+    "Tile128": {
+        "matmul_add_task_num": 32,
+        "incore_task_granularity": {"incore_data_size": 128, "incore_loop": 4},
+        "grid_k": 2,
+    },
+    # --- Batch/Group Sweep (fixed: tile=128, grid_k=2, incore_loop=4) ---
+    "Batch1": {
+        "matmul_add_task_num": 2,
+        "incore_task_granularity": {"incore_data_size": 128, "incore_loop": 4},
+        "grid_k": 2,
+    },
+    "Batch4": {
+        "matmul_add_task_num": 8,
+        "incore_task_granularity": {"incore_data_size": 128, "incore_loop": 4},
+        "grid_k": 2,
+    },
+    "Batch64": {
+        "matmul_add_task_num": 128,
+        "incore_task_granularity": {"incore_data_size": 128, "incore_loop": 4},
+        "grid_k": 2,
+    },
+    # --- K Dimension Sweep (fixed: tile=128, num_groups=16, incore_loop=4) ---
+    "K1": {
+        "matmul_add_task_num": 16,
+        "incore_task_granularity": {"incore_data_size": 128, "incore_loop": 4},
+        "grid_k": 1,
+    },
+    "K4": {
         "matmul_add_task_num": 64,
-        "incore_task_granularity": {
-            "incore_data_size": 128,
-            "incore_loop": 4,
-        },
+        "incore_task_granularity": {"incore_data_size": 128, "incore_loop": 4},
         "grid_k": 4,
     },
+    "K8": {
+        "matmul_add_task_num": 128,
+        "incore_task_granularity": {"incore_data_size": 128, "incore_loop": 4},
+        "grid_k": 8,
+    },
+    # --- In-Core Loop Sweep (fixed: tile=128, num_groups=16, grid_k=2) ---
+    "Loop1": {
+        "matmul_add_task_num": 32,
+        "incore_task_granularity": {"incore_data_size": 128, "incore_loop": 1},
+        "grid_k": 2,
+    },
+    "Loop16": {
+        "matmul_add_task_num": 32,
+        "incore_task_granularity": {"incore_data_size": 128, "incore_loop": 16},
+        "grid_k": 2,
+    }
 }
 
-DEFAULT_CASE = "Case0"
+DEFAULT_CASE = "Case1"
 
 
 def generate_inputs(params: dict) -> list:
