@@ -29,14 +29,23 @@ import argparse
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
+
+# Make golden/ importable so we can share varseq_cases with the test suite
+_project_root = Path(__file__).parent.parent
+_golden_dir = _project_root / "golden"
+if _golden_dir.exists():
+    sys.path.insert(0, str(_golden_dir))
 
 try:
     import torch_npu  # noqa: F401
 except ImportError:
     print("ERROR: torch_npu is not installed. This script requires an Ascend NPU environment.")
     sys.exit(1)
+
+from varseq_cases import VARSEQ_CASE1_LENS, VARSEQ_CASE2_LENS
 
 
 # ---------------------------------------------------------------------------
@@ -47,12 +56,14 @@ PREDEFINED_CASES = {
     "Case1": dict(
         batch=256, num_heads=16, kv_head_num=1, head_dim=128,
         block_size=128, context_len=8192, max_model_len=32768,
-        dtype="bfloat16", desc="batch=256, heads=16, ctx=8K, blk=128",
+        dtype="bfloat16", desc="batch=256, heads=16, varseq=[512..16384], blk=128",
+        context_lens_list=VARSEQ_CASE1_LENS,
     ),
     "Case2": dict(
         batch=64, num_heads=64, kv_head_num=1, head_dim=128,
         block_size=64, context_len=8192, max_model_len=32768,
-        dtype="bfloat16", desc="batch=64, heads=64, ctx=8K, blk=64",
+        dtype="bfloat16", desc="batch=64, heads=64, varseq=[512..16384], blk=64",
+        context_lens_list=VARSEQ_CASE2_LENS,
     ),
     "Case3": dict(
         batch=64, num_heads=64, kv_head_num=1, head_dim=256,

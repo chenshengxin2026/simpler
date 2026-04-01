@@ -5,6 +5,7 @@ from paged_attention_golden import (
     compute_golden,
     run_golden_test,
 )
+from varseq_cases import VARSEQ_CASE1_LENS, VARSEQ_CASE2_LENS
 
 __outputs__ = ["out"]
 
@@ -19,6 +20,7 @@ ALL_CASES = {
         "head_dim": 128,
         "block_size": 128,
         "context_len": 8192,
+        "context_lens_list": VARSEQ_CASE1_LENS,
         "max_model_len": 32768,
         "dtype": "bfloat16",
     },
@@ -29,6 +31,7 @@ ALL_CASES = {
         "head_dim": 128,
         "block_size": 64,
         "context_len": 8192,
+        "context_lens_list": VARSEQ_CASE2_LENS,
         "max_model_len": 32768,
         "dtype": "bfloat16",
     },
