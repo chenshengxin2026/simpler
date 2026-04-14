@@ -18,9 +18,9 @@
 #include <string>
 #include <utility>
 
-#include "common.h"       // NOLINT(build/include_subdir)
-#include "data_type.h"    // NOLINT(build/include_subdir)
-#include "pto_task_id.h"  // NOLINT(build/include_subdir)
+#include "common.h"
+#include "data_type.h"
+#include "pto_task_id.h"
 
 constexpr int RUNTIME_MAX_TENSOR_DIMS = 5;
 
@@ -64,7 +64,7 @@ struct Segment {
  * must remain valid (not a temporary) until after the submit call.
  */
 class alignas(64) TensorCreateInfo {
-public:  // NOLINT(whitespace/indent)
+public:
     TensorCreateInfo(
         const uint32_t shapes[], uint32_t ndims, DataType dtype = DataType::FLOAT32, bool manual_dep = false
     ) :
@@ -97,7 +97,7 @@ public:  // NOLINT(whitespace/indent)
         return total * get_element_size(dtype);
     }
 
-public:  // NOLINT(whitespace/indent)
+public:
     // --- Bytes [0, 32): TensorCreateInfo-only fields ---
     // These occupy the same positions as Tensor::buffer, Tensor::owner_task_id,
     // and Tensor::start_offset. The runtime overwrites owner metadata after the
@@ -297,8 +297,8 @@ struct alignas(64) Tensor {
         always_assert(reinterpret_cast<char *>(buffer.addr) != nullptr);
         uint64_t elem_size = get_element_size(dtype);
         char *dst = reinterpret_cast<char *>(buffer.addr);
-        constexpr uint64_t BLK = 64;
-        uint64_t blk = (buffer.size < BLK) ? buffer.size : BLK;
+        constexpr uint64_t blk_size = 64;
+        uint64_t blk = (buffer.size < blk_size) ? buffer.size : blk_size;
         for (uint64_t b = 0; b < blk; b += elem_size) {
             memcpy(dst + b, &initial_value, elem_size);
         }
