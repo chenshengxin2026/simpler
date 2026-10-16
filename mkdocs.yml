@@ -107,6 +107,9 @@ nav:
               - simpler.worker: user/reference/api/worker.md
               - simpler.task_interface: user/reference/api/task_interface.md
               - simpler.orchestrator: user/reference/api/orchestrator.md
+  - WSE A3 simulation:
+      - Overview and FFN validation: wse-mock/README.md
+      - Runtime contract: wse-calendar-a3.md
   - Architecture:
       - Chip-Level Architecture: chip-level-arch.md
       - Hierarchical Level Runtime: hierarchical-level-runtime.md
