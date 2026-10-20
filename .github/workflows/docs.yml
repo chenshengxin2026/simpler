@@ -43,7 +43,8 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          # Match PyPTO's tested Python 3.11 documentation toolchain.
+          python-version: "3.11"
           cache: pip
           cache-dependency-path: |
             docs/requirements.txt

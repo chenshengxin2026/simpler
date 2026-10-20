@@ -2,6 +2,9 @@
 
 **Make writing runtime simpler.**
 
+Experimental [WSE Calendar A3 simulation](docs/wse-mock/README.md):
+deployment stubs, host mock runtime, portable FFN build, and golden validation.
+
 Modular runtime for building and executing task dependency graphs on Ascend devices with coordinated AICPU and AICore execution. Three independently compiled programs (Host `.so`, AICPU `.so`, AICore `.o`) work together through clearly defined APIs.
 
 ## Where simpler sits in the stack
