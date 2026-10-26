@@ -250,7 +250,8 @@ public:
     // run and may run either side of this.
     int initialize(
         int num_dump_threads, int device_id, DumpArgsLevel dump_args_level, const DumpAllocCallback &alloc_cb,
-        DumpRegisterCallback register_cb, const DumpFreeCallback &free_cb
+        DumpRegisterCallback register_cb, const DumpFreeCallback &free_cb,
+        DumpUnregisterCallback unregister_cb = nullptr
     );
 
     // Start a run's collection window: bind its artifact configuration, drop the

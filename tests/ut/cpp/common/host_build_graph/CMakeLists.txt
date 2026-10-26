@@ -71,6 +71,12 @@ hbg_cases(
     # Calls the real ready_queue_init_data_from_layout. The sizing TU it needs
     # comes with the orchestrator library, which globs host/.
     test_hbg_ready_queue_seed.cpp
+    # Calls the real calculate_output_layout, which comes with the orchestrator
+    # library (globs host/).
+    test_hbg_output_layout.cpp
+    # Repeated real binds over retained scratch: reinit, a failed discharge, and
+    # the same calculate_output_layout reachable through the orchestrator library.
+    test_hbg_scratch_retention.cpp
     ORCH)
 
 hbg_case(test_hbg_graph_cache.cpp
@@ -92,11 +98,16 @@ hbg_case(test_hbg_bind_ledger.cpp
     SOURCES
         ${SIMPLER_SRC}/@arch@/runtime/host_build_graph/host/runtime_maker.cpp
         ${HBG_HOST_DIR}/orchestrator.cpp
+        ${HBG_HOST_DIR}/graph_recording.cpp
+        ${HBG_HOST_DIR}/graph_submit.cpp
+        ${HBG_HOST_DIR}/graph_host_state.cpp
+        ${HBG_HOST_DIR}/orch_profiling.cpp
         ${HBG_SHARED_RUNTIME_SOURCES}
         ${HBG_HOST_DIR}/runtime_core.cpp
         ${HBG_HOST_DIR}/dep_gen_host_graph.cpp
         ${HBG_HOST_DIR}/graph_recorder_pool.cpp
         ${HBG_HOST_DIR}/host_phase_trace.cpp
+        ${SIMPLER_SRC}/common/platform/shared/host/host_phase_records.cpp
         ${HBG_HOST_DIR}/ready_queue_sizing.cpp
         ${HBG_HOST_DIR}/host_tensor_access.cpp
         ${SIMPLER_SRC}/common/platform/shared/host/platform_compile_info.cpp

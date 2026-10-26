@@ -61,10 +61,6 @@
 // Scheduler context class
 #include "scheduler/scheduler_context.h"
 
-// From orchestration/common.cpp linked into this DSO — updates g_current_runtime
-// here (cleared on teardown before runtime_destroy).
-extern "C" void framework_bind_runtime(RuntimeContext *rt);
-
 static int32_t read_runtime_status(Runtime *runtime) {
     if (runtime == nullptr) {
         return 0;
@@ -406,8 +402,7 @@ int32_t LegacyAicpuExecutor::run(Runtime *runtime) {
     }
 
     // Always shutdown AICore — even if sched_ctx_.completed_ was already true.
-    // platform_deinit_aicore_regs is idempotent.
-    int32_t shutdown_rc = sched_ctx_.shutdown(thread_idx);
+    int32_t shutdown_rc = sched_ctx_.shutdown(runtime, thread_idx);
     // Both outcomes reach the terminal record before this thread's arrival, and
     // with the state that produced each: folding shutdown_rc into run_rc first
     // would publish a teardown failure as an execution one.
@@ -434,8 +429,6 @@ int32_t LegacyAicpuExecutor::run(Runtime *runtime) {
         // every run, so always tear them down here.
         if (rt != nullptr) {
             rt->scheduler->print_queues();
-            // Clear g_current_runtime in this DSO before destroying rt.
-            framework_bind_runtime(nullptr);
             // A Graph's expansion storage is the tail of its outer task's heap
             // allocation, so it retires with that allocation; nothing here owns
             // a separate block to release.
@@ -474,8 +467,7 @@ void LegacyAicpuExecutor::deinit(Runtime *runtime) {
     //    The length is the device descriptor, not sizeof(Runtime): the host-only
     //    tail past it is never on the device at all. It deliberately spans more
     //    than the uploaded prefix, keeping maintenance over the whole allocated
-    //    descriptor — including the gate array, which A5 declares but no A5 code
-    //    reads or writes.
+    //    descriptor — including the device-owned gate array.
     cache_invalidate_range(runtime, sizeof(runtime->dev));
 
     // Reset all SchedulerContext-owned state in one place.

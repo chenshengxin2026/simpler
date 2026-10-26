@@ -56,8 +56,13 @@ ScopeStatsCollector::~ScopeStatsCollector() {
 
 int ScopeStatsCollector::init(
     int num_threads, const ScopeStatsAllocCallback &alloc_cb, ScopeStatsRegisterCallback register_cb,
-    const ScopeStatsFreeCallback &free_cb, int device_id
-) {
+    const ScopeStatsFreeCallback &free_cb, int device_id, ScopeStatsUnregisterCallback unregister_cb
+) try {
+    if (register_cb != nullptr && unregister_cb == nullptr) {
+        LOG_ERROR("ScopeStats collector registration requires an unregister callback");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+
     if (num_threads <= 0 || num_threads > PLATFORM_MAX_AICPU_THREADS || alloc_cb == nullptr || free_cb == nullptr) {
         LOG_ERROR(
             "ScopeStatsCollector::init: invalid arguments (num_threads=%d, valid range: 1-%d)", num_threads,
@@ -88,14 +93,16 @@ int ScopeStatsCollector::init(
     // allocation succeeds — start(tf) gates on shm_host_.
     set_memory_context(
         alloc_cb, register_cb, free_cb, profiling_copy_to_device_or_null(), profiling_copy_from_device_or_null(),
-        /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id
+        /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id, unregister_cb
     );
 
     // RAII rollback: any early return after this point releases every
     // framework-tracked buffer (shm region + per-buffer-state PmuBuffer-style
     // entries) via free_cb. `guard.commit()` runs on the success path before
     // the trailing return 0.
-    profiling_common::InitRollbackGuard<decltype(manager_)> guard(manager_, free_cb);
+    profiling_common::InitRollbackGuard<decltype(manager_)> guard(
+        manager_, free_cb, register_cb != nullptr ? unregister_cb : nullptr, device_id
+    );
 
     const int num_instances = 1;
     size_t shm_size = calc_scope_stats_shm_size(num_instances);
@@ -136,25 +143,21 @@ int ScopeStatsCollector::init(
 
     // Push the entire initialized shm region (header + BufferState +
     // free_queue contents) to device.
-    profiling_copy_to_device(shm_dev_local, shm_host_local, shm_size);
+    if (int rc = profiling_copy_to_device(shm_dev_local, shm_host_local, shm_size); rc != 0) return rc;
 
-    initialized_ = true;
-    shm_dev_ = shm_dev_local;
     guard.commit();
+    shm_dev_ = shm_dev_local;
 
-    // Re-set_memory_context now that the shm region is ready. start(tf) gates
-    // on shm_host_ being non-null, so this is the moment the collector becomes
-    // startable.
-    set_memory_context(
-        alloc_cb, register_cb, free_cb, profiling_copy_to_device_or_null(), profiling_copy_from_device_or_null(),
-        shm_dev_local, shm_host_local, shm_size, device_id
-    );
+    publish_shared_memory(shm_dev_local, shm_host_local, shm_size);
+    initialized_ = true;
 
     LOG_INFO(
         "ScopeStats collector initialized: %d threads, SHM=0x%lx", num_threads,
         reinterpret_cast<unsigned long>(shm_dev_)
     );
     return 0;
+} catch (const std::bad_alloc &) {
+    return PTO_RUNTIME_ERR_INTERNAL;
 }
 
 // ---------------------------------------------------------------------------
@@ -584,6 +587,8 @@ void ScopeStatsCollector::finalize(ScopeStatsUnregisterCallback unregister_cb, c
     }
     recovered_current_buf_ = 0;
     recovered_current_total_ = 0;
+
+    if (!validate_release_callbacks(unregister_cb, free_cb)) return;
 
     auto release_dev = [&](void *p) {
         release_one_buffer(p, unregister_cb, free_cb);

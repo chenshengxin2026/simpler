@@ -91,10 +91,17 @@ extern "C" const PipelineContract *get_pipeline_contract(void) {
     // callable sizing and then served from the prebuilt-arena cache
     // (build_and_cache_prebuilt_arena runs only on a miss), so a run reuses the
     // instance the previous run left behind.
+    //
+    // One shared scratch serves any number of runs because the AICPU stream is a
+    // FIFO and that order is transitive: a run ordered behind the run ahead of
+    // it is ordered behind everything that run was ordered behind. So
+    // `pipeline_depth` declares no limit either — what bounds concurrency here
+    // is the per-run task-args region, and a context gets one of those per set
+    // it was granted.
     static const PipelineContract contract = {
         PTO_PIPELINE_CONTRACT_ABI_VERSION,
         6,
-        2,
+        UINT32_MAX,
         {
             {PTO_PIPELINE_TASK_ARGS, PTO_PIPELINE_HOST_PER_RUN, 0},
             {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_DEVICE_SCRATCH, 0},
@@ -108,6 +115,42 @@ extern "C" const PipelineContract *get_pipeline_contract(void) {
 }
 
 extern "C" int concurrent_native_prepare_supported_impl(void) { return 1; }
+
+/**
+ * One run's native submission may be ordered behind another's on this platform.
+ *
+ * The three pooled regions above are one instance each, so a successor's AICPU
+ * op must not begin before its predecessor's has returned: that op resets the
+ * arena, orchestrates and dispatches until every task completes, retires the
+ * cores, and destroys the runtime context, all across its own span.
+ *
+ * a2a3 submits every run on one persistent AICPU + AICore stream pair, and the
+ * two streams carry different halves of the ordering:
+ *
+ *   - The successor's AICore work waits on an *event*: its stream takes
+ *     `aclrtStreamWaitEvent` on the predecessor's whole-operator boundary, and
+ *     records a proof event immediately behind that wait so the predecessor can
+ *     retire its own boundary without awaiting this run's kernels.
+ *   - The successor's AICPU op is ordered by the *queue*: a stream is a FIFO,
+ *     and the predecessor's AICPU payload, its own-AICore-boundary wait, its
+ *     whole-operator marker and its boundary record all sit ahead of it. So the
+ *     arena reset cannot be dispatched until the predecessor's own AICore kernel
+ *     has ended, which is what the single shared instance needs.
+ *
+ * That second half is sound only behind a boundary covering both of the
+ * predecessor's kernels, and only such a boundary is offered: the own-AICore
+ * wait is queued *after* the AICPU payload — the AICPU kernel spins in the
+ * handshake until the AICore workers publish, so holding its launch behind its
+ * own AICore kernel's end would deadlock the pair — and a predecessor that
+ * published no whole-operator boundary is refused as a join target.
+ *
+ * The bind cannot rewrite those regions beside a live run either:
+ * `prepared_run_config_compatible_impl` below answers yes only on a
+ * prebuilt-arena-cache hit, where the bind writes no device byte, and the only
+ * code that builds or uploads the arena image runs on a miss, which the
+ * platform refuses while a predecessor holds the bank.
+ */
+extern "C" int joined_native_launch_supported_impl(void) { return 1; }
 
 static_assert(RUNTIME_ENV_RING_COUNT == CHIP_MAX_RING_DEPTH, "RuntimeEnv ring count must match the runtime ring depth");
 
@@ -216,27 +259,6 @@ static bool resolve_ring_config(
     return true;
 }
 
-static int32_t read_runtime_status(const Runtime *runtime, const HostApi *api, SharedMemoryHeader *host_header) {
-    if (runtime == nullptr || host_header == nullptr) {
-        return 0;
-    }
-
-    void *device_sm = runtime->get_gm_sm_ptr();
-    if (device_sm == nullptr) {
-        return 0;
-    }
-
-    int hdr_rc = api->copy_from_device(host_header, device_sm, sizeof(SharedMemoryHeader));
-    if (hdr_rc != 0) {
-        LOG_WARN("Failed to copy the shared-memory header from device");
-        return 0;
-    }
-
-    int32_t orch_error_code = host_header->orch_error_code.load(std::memory_order_relaxed);
-    int32_t sched_error_code = host_header->sched_error_code.load(std::memory_order_relaxed);
-    return runtime_status_from_error_codes(orch_error_code, sched_error_code);
-}
-
 /**
  * This run's own error tail, published by its device side into storage the run
  * owns, or 0 when the run published none.
@@ -296,8 +318,8 @@ extern "C" int register_callable_impl(const ChipCallable *callable, const HostAp
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     for (const ChildKernelAddr &c : out->kernel_addrs) {
-        if (c.func_id < 0 || c.func_id >= RUNTIME_MAX_FUNC_ID) {
-            LOG_ERROR("func_id=%d is out of range [0, %d)", c.func_id, RUNTIME_MAX_FUNC_ID);
+        if (c.func_id < 0 || c.func_id >= CHIP_MAX_FUNC_ID) {
+            LOG_ERROR("func_id=%d is out of range [0, %d)", c.func_id, CHIP_MAX_FUNC_ID);
             return PTO_RUNTIME_ERR_INTERNAL;
         }
     }
@@ -619,11 +641,10 @@ static void apply_orch_sched_env_flags(Runtime *runtime) {
 // shot, at the sizes derive_arena_static_sizes already resolved. Idempotent
 // across runs — the pools are owned by DeviceRunner and freed in
 // DeviceRunner::finalize().
-static bool ensure_static_arenas(const HostApi *api, const ArenaStaticSizes &sizes, StaticArenaPtrs *out) {
+static int ensure_static_arenas(const HostApi *api, const ArenaStaticSizes &sizes, StaticArenaPtrs *out) {
     int64_t t_setup_start = _now_ms();
-    if (api->setup_static_arena(sizes.total_heap, sizes.sm_size, sizes.runtime_image_size) != 0) {
-        LOG_ERROR("Failed to setup pooled static arena");
-        return false;
+    if (const int rc = api->setup_static_arena(sizes.total_heap, sizes.sm_size, sizes.runtime_image_size); rc != 0) {
+        return rc;
     }
     int64_t t_setup_end = _now_ms();
 
@@ -632,7 +653,7 @@ static bool ensure_static_arenas(const HostApi *api, const ArenaStaticSizes &siz
     int64_t t_heap_end = _now_ms();
     if (out->gm_heap == nullptr) {
         LOG_ERROR("Failed to acquire pooled GM heap");
-        return false;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     int64_t t_sm_start = _now_ms();
@@ -640,19 +661,19 @@ static bool ensure_static_arenas(const HostApi *api, const ArenaStaticSizes &siz
     int64_t t_sm_end = _now_ms();
     if (out->gm_sm == nullptr) {
         LOG_ERROR("Failed to acquire pooled shared memory");
-        return false;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     out->runtime_arena_dev = api->acquire_pooled_runtime_arena();
     if (out->runtime_arena_dev == nullptr) {
         LOG_ERROR("Failed to acquire pooled runtime arena");
-        return false;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     LOG_INFO("TIMING: static_arena_setup = %" PRId64 "ms", t_setup_end - t_setup_start);
     LOG_INFO("TIMING: gm_heap_acquire = %" PRId64 "ms", t_heap_end - t_heap_start);
     LOG_INFO("TIMING: shared_mem_acquire = %" PRId64 "ms", t_sm_end - t_sm_start);
-    return true;
+    return 0;
 }
 
 // per-(cid,config): build the prebuilt runtime-arena image on host. Pure host
@@ -739,30 +760,30 @@ static void store_prebuilt_runtime_image(
 // the run path can wire the runtime directly instead of depending on a cache
 // round-trip. Shared by the lazy first-run miss path and the eager
 // prewarm_config_impl entry, so both build the arena identically.
-static bool build_and_cache_prebuilt_arena(
+static int build_and_cache_prebuilt_arena(
     const HostApi *api, const ArenaSizingConfig &sizing, StaticArenaPtrs *out_ptrs = nullptr,
     RuntimeArenaLayout *out_layout = nullptr
 ) {
     ArenaStaticSizes sizes;
     if (!derive_arena_static_sizes(sizing, &sizes)) {
-        return false;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     StaticArenaPtrs ptrs;
-    if (!ensure_static_arenas(api, sizes, &ptrs)) {
-        return false;
+    if (const int rc = ensure_static_arenas(api, sizes, &ptrs); rc != 0) {
+        return rc;
     }
 
     DeviceArena host_arena;  // libc malloc backend; owns the image until upload
     RuntimeArenaLayout layout;
     if (!build_runtime_image(sizing, sizes, ptrs, &host_arena, &layout)) {
-        return false;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     int rc_upload = api->copy_to_device(ptrs.runtime_arena_dev, host_arena.base(), layout.offsets.arena_size);
     if (rc_upload != 0) {
         LOG_ERROR("Failed to rtMemcpy prebuilt runtime arena to device (rc=%d)", rc_upload);
-        return false;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     PrebuiltRuntimeArenaCacheProbe probe = make_prebuilt_runtime_arena_cache_probe(sizing);
@@ -773,7 +794,7 @@ static bool build_and_cache_prebuilt_arena(
     if (out_layout != nullptr) {
         *out_layout = layout;
     }
-    return true;
+    return 0;
 }
 
 /**
@@ -848,9 +869,8 @@ extern "C" int bind_callable_to_runtime_impl(
     // bump-slice from it.
     RetainedTempBump bump;
     const size_t required_temp_bytes = packed_temp_bytes(orch_args);
-    if (!bump.begin(api, required_temp_bytes)) {
-        LOG_ERROR("Retained temp buffer grow failed: required bytes %zu", required_temp_bytes);
-        return PTO_RUNTIME_ERR_INTERNAL;
+    if (const int rc = bump.begin_status(api, required_temp_bytes); rc != 0) {
+        return rc;
     }
 
     auto bind_cleanup = RAIIScopeGuard([&]() {
@@ -881,8 +901,8 @@ extern "C" int bind_callable_to_runtime_impl(
             // binds successfully.
             StaticArenaPtrs ptrs;
             RuntimeArenaLayout layout;
-            if (!build_and_cache_prebuilt_arena(api, sizing, &ptrs, &layout)) {
-                return PTO_RUNTIME_ERR_INTERNAL;
+            if (const int rc = build_and_cache_prebuilt_arena(api, sizing, &ptrs, &layout); rc != 0) {
+                return rc;
             }
             runtime->set_orch_args(device_args);
             runtime->set_gm_sm_ptr(ptrs.gm_sm);
@@ -924,7 +944,7 @@ extern "C" int prewarm_config_impl(
     }
 
     STRACE("chip.prewarm.build");
-    return build_and_cache_prebuilt_arena(api, sizing) ? 0 : PTO_RUNTIME_ERR_INTERNAL;
+    return build_and_cache_prebuilt_arena(api, sizing);
 }
 
 /**
@@ -1013,25 +1033,28 @@ extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi 
     SharedMemoryHeader host_header;
     memset(&host_header, 0, sizeof(host_header));
 
-    // Both status channels are device state, readable only for a run that
-    // reached a stream. A run that failed before launch has published nothing
-    // and its shared memory belongs to whoever ran there last.
+    // This run's own published record, and only that. It is device state, so it
+    // is readable only for a run that reached a stream: a run that failed before
+    // launch published nothing and its shared memory belongs to whoever ran
+    // there last.
+    //
+    // The shared memory header is not read. It is one instance across runs, so a
+    // launched successor resets and refills it as soon as this run's boundary
+    // releases it — and that boundary is the same fence that lets this host call
+    // proceed, so there is no window here in which the header is still this
+    // run's. Both platforms serving this runtime — onboard and sim — hand each
+    // pipeline slot its own epoch-stamped result region instead, and the device
+    // side publishes into it before its kernel returns, hence before that
+    // fence. A run that published none keeps the execution error its caller
+    // already holds, which is a status without the device-side detail rather
+    // than a success.
     if (execution_rc != 0 && launched != 0) {
         runtime_status = read_published_run_status(api, &host_header);
         if (runtime_status == 0) {
-            // No snapshot from this run, so fall back to the shared header. That
-            // read is only sound under the current single-launched contract:
-            // this run still holds its execution claim, no successor has been
-            // launched, and nothing has reset or rebuilt the shared memory since
-            // this run wrote it. Once P4 admits a launched successor the branch
-            // has to be reworked — an unproven read could then report the
-            // successor's header as this run's error. A run that published
-            // nothing keeps its execution error either way; only the diagnostic
-            // detail is missing.
-            runtime_status = read_runtime_status(runtime, api, &host_header);
-            if (runtime_status != 0) {
-                LOG_WARN("no error snapshot from this run; the failure detail below is read from the shared header");
-            }
+            LOG_WARN(
+                "this run published no terminal record; its execution status stands and the device-side detail is "
+                "in the device log"
+            );
         }
     }
     if (runtime_status != 0) {

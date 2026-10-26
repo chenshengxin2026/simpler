@@ -34,6 +34,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -43,6 +44,7 @@
 
 #include "runtime_c_api.h"
 #include "native_run_execution.h"
+#include "run_resource_arena.h"
 
 #include "callable.h"
 #include "call_config.h"
@@ -64,6 +66,7 @@
 #include "host/dfx_run_config.h"
 #include "host/host_phase_records.h"
 #include "host/host_phase_run_state.h"
+#include "host/run_resource_slots.h"
 #include "host/args_dump_collector.h"
 #include "host/host_graph_exporter.h"
 #include "host/pmu_collector.h"
@@ -84,10 +87,22 @@ constexpr int SIM_AUTO_BLOCKDIM = 8;
 class SimDeviceRunnerBase {
 public:
     SimDeviceRunnerBase() {
-        for (auto &bank : arena_banks_) {
-            bank = std::make_unique<ArenaBank>(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_);
-        }
+        commit_run_resources(kDefaultRunResourceSets, build_run_resources(kDefaultRunResourceSets));
     }
+
+    /**
+     * Size every per-run resource to the count of run-resource sets this
+     * context was granted.
+     *
+     * The grant is the worker's, not this module's: the module declares what it
+     * supports, and the worker decides how much of that this context uses. It
+     * arrives once, before any run can name a set. Refused once an arena bank
+     * is committed, because a run's lease names its set by index.
+     */
+    bool set_run_resource_grant(size_t granted);
+
+    /** How many run-resource sets this runner currently holds. */
+    size_t run_resource_grant() const { return granted_run_resource_sets_; }
 
     uint64_t arena_bank_gm_heap_base(uint32_t bank_id) const;
 
@@ -123,7 +138,8 @@ public:
             dfx(std::move(other.dfx)),
             pipeline_slot(other.pipeline_slot),
             num_aicore(other.num_aicore),
-            launch_aicpu_num(other.launch_aicpu_num) {}
+            launch_aicpu_num(other.launch_aicpu_num),
+            artifact_identity(other.artifact_identity) {}
         PreparedExecution &operator=(PreparedExecution &&) = delete;
 
         NativeRunIdentity identity{};
@@ -140,13 +156,22 @@ public:
          * no correctness weight here — it keeps the two runner shapes the same.
          */
         DfxRunConfig dfx{};
-        uint32_t pipeline_slot{PTO_PIPELINE_MAX_DEPTH};
+        uint32_t pipeline_slot{UINT32_MAX};
         int num_aicore{0};
         int launch_aicpu_num{0};
+        /**
+         * This run's whole published identity, copied from its descriptor.
+         *
+         * `identity` above is what later phase calls address the run by and has
+         * no field for `run_id`; a diagnostic artifact needs that plus the
+         * submitting Worker's provenance to be attributed to its submission. An
+         * all-zero `owner_instance_id` means the caller stated none.
+         */
+        NativeRunArtifactIdentity artifact_identity{};
     };
 
     struct ActiveExecution {
-        explicit ActiveExecution(std::unique_ptr<PreparedExecution> prepared_in, LaunchProgress progress_in) :
+        explicit ActiveExecution(std::unique_ptr<PreparedExecution> prepared_in, LaunchProgress progress_in) noexcept :
             prepared(std::move(prepared_in)),
             progress(progress_in) {}
         ActiveExecution(const ActiveExecution &) = delete;
@@ -171,7 +196,12 @@ public:
         Runtime &runtime, const CallConfig &config, uint32_t pipeline_slot, const NativeRunIdentity &identity,
         std::unique_ptr<PreparedExecution> *prepared
     ) = 0;
-    virtual LaunchOutcome launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) = 0;
+    /**
+     * Allocate the active owner before entering the backend. An escaping backend
+     * exception returns Partial with that same prepared state still owned; only
+     * an explicit NotStarted result returns it for rollback.
+     */
+    LaunchOutcome launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) noexcept;
     virtual void abandon_prepared_execution(PreparedExecution &prepared) noexcept = 0;
     /** Return one of the SIMPLER_NATIVE_RUN_POLL_* values without waiting. */
     virtual int poll_execution(const ActiveExecution &active) = 0;
@@ -234,7 +264,7 @@ public:
     bool native_run_active() const;
     bool native_run_owned_by(const void *owner) const;
     bool can_accept_run() const { return !launch_poisoned_.load(std::memory_order_acquire); }
-    void poison_launch() { launch_poisoned_.store(true, std::memory_order_release); }
+    void poison_launch() noexcept { launch_poisoned_.store(true, std::memory_order_release); }
 
     // --- Shared methods --------------------------------------------------
 
@@ -357,6 +387,12 @@ public:
     int acquire_scheduler_state_storage(
         uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **host_out
     );
+    std::shared_ptr<void> get_orchestration_scratch(uint32_t slot) const {
+        return slot < orchestration_scratch_.size() ? orchestration_scratch_[slot] : std::shared_ptr<void>{};
+    }
+    void set_orchestration_scratch(uint32_t slot, std::shared_ptr<void> scratch) {
+        if (slot < orchestration_scratch_.size()) orchestration_scratch_[slot] = std::move(scratch);
+    }
     int acquire_sm_mirror(uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out);
     /**
      * Retain the host buffer a run assembles its device execution image in.
@@ -399,6 +435,15 @@ public:
     );
     int unregister_callable(int32_t callable_id);
     bool has_callable(int32_t callable_id) const;
+
+    /**
+     * Serializes the registration, unregistration and finalize entry points,
+     * so an auto-ID scan and the ID it claims are one atomic step with respect
+     * to explicit-ID registration and unregistration. Runs, initialization and
+     * destroy are still caller-serialized.
+     */
+    std::mutex &callable_registration_mutex() { return callable_registration_mu_; }
+
     // One-step bind: install the reference to the callable's
     // registration-owned function tables and its active_callable_id, then run
     // the per-run bind_callable_to_runtime_impl with the state's
@@ -444,6 +489,10 @@ public:
      */
     ExecutionModeLatch &execution_mode_latch() { return execution_mode_latch_; }
 
+    /** True only after simpler_init succeeds and before teardown begins. */
+    bool program_initialized() const { return program_initialized_; }
+    void set_program_initialized(bool initialized) { program_initialized_ = initialized; }
+
     uint64_t last_device_wall_ns() const { return device_wall_ns_; }
     // Per-phase AICPU wall (ns) from the most recent run; RunWall aliases
     // last_device_wall_ns(). 0 for a phase that was never stamped. Used to emit
@@ -479,6 +528,14 @@ public:
     bool host_clock_alignment_log_required(uint32_t pipeline_slot) const {
         return pipeline_slot < host_phase_runs_.size() && host_phase_runs_[pipeline_slot].needs_clock_alignment();
     }
+    /**
+     * This slot's own host-orchestration state, for a run that must not read
+     * the collector's single resident copy.
+     */
+    bool host_orchestrated_for_slot(uint32_t pipeline_slot) const noexcept {
+        if (pipeline_slot >= host_phase_runs_.size()) return false;
+        return host_phase_runs_[pipeline_slot].host_orchestrated;
+    }
     /** Hand this pass's records to the swimlane reader, just before its export. */
     void publish_host_phase_records_to_swimlane(uint32_t pipeline_slot);
     /**
@@ -500,7 +557,9 @@ public:
      * Returns non-zero when a collector that retains runs would not admit this
      * one; see the onboard base for why that fails the run.
      */
-    int start_shared_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch);
+    int start_shared_collectors_for_run(
+        const DfxRunConfig &dfx, uint64_t run_epoch, const RunLocalDfxMetadata &run_metadata
+    );
 
     /**
      * Give back what the call above admitted for a run that submitted nothing.
@@ -564,7 +623,7 @@ public:
      * the device reads as "publish no snapshot". Diagnostic-only and never a
      * prepare failure. Mirrors the onboard base.
      */
-    uint64_t arm_chip_swimlane_run_terminal_bank(uint32_t pipeline_slot, uint64_t run_epoch);
+    uint64_t arm_chip_swimlane_run_terminal_bank(uint64_t run_epoch);
     /** Write this pass's per-event host phase records, if it collected any. */
     void write_host_phase_records_artifact(const std::string &output_prefix, uint32_t pipeline_slot);
     /**
@@ -581,6 +640,13 @@ public:
      * `run_epoch` identifies the run whose retained terminal snapshot is read
      * back, which happens only when `device_execution_complete` says the caller
      * observed this run's completion.
+     *
+     * `device_producers_stopped` is the separate fact that no producer can
+     * still be writing into this run's terminal bank. A simulated device's
+     * producers are the AICPU and AICore threads of this process, so a caller
+     * that joined them knows it; pass it only from such a caller. It decides
+     * whether a *failed* run's bank is returned unread or withdrawn, and it
+     * never licenses reading a snapshot the run did not complete.
      */
     /**
      * Returns non-zero when a collector's close reported an ownership failure
@@ -589,7 +655,8 @@ public:
      * diagnosis.
      */
     int teardown_shared_collectors_after_run(
-        const DfxRunConfig &dfx, uint32_t pipeline_slot, uint64_t run_epoch, bool device_execution_complete
+        const DfxRunConfig &dfx, uint32_t pipeline_slot, uint64_t run_epoch, bool device_execution_complete,
+        bool device_producers_stopped
     );
     // Diagnostic artifact root directory (CallConfig::validate() enforces non-empty
     // upstream when any diagnostic is enabled).
@@ -606,6 +673,8 @@ public:
     size_t host_dlopen_count() const { return host_dlopen_total_; }
 
 protected:
+    virtual LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) = 0;
+
     // --- Helpers usable by subclass execution / finalize -----------------
     int ensure_device_initialized();
     virtual int ensure_binaries_loaded() = 0;
@@ -649,6 +718,7 @@ protected:
     // This context's execution identity. Write-once: the first init entry to
     // run latches it, and it never changes afterwards.
     ExecutionModeLatch execution_mode_latch_;
+    bool program_initialized_{false};
 
     // Executor binaries — populated once via set_executors() during simpler_init,
     // owned for the rest of the runner's lifetime.
@@ -663,8 +733,8 @@ protected:
     // The device allocations a caller minted through this context, and which runs still hold them
     // — see host/caller_device_buffers.h.
     CallerDeviceBuffers caller_device_buffers_;
-    std::array<void *, PTO_PIPELINE_MAX_DEPTH> retained_temp_addrs_{};
-    std::array<size_t, PTO_PIPELINE_MAX_DEPTH> retained_temp_sizes_{};
+    RunResourceSlots<void *> retained_temp_addrs_;
+    RunResourceSlots<size_t> retained_temp_sizes_;
     // One pipeline slot's Graph Definition bytes: `staging` is what the
     // recorders build their objects into, grow-only and content-preserving, and
     // `snapshot` is the copy a published run reads. Two buffers rather than one
@@ -675,12 +745,12 @@ protected:
         std::vector<std::byte> bytes;
         std::vector<std::byte> snapshot;
     };
-    std::array<RetainedGraphStaging, PTO_PIPELINE_MAX_DEPTH> graph_definition_staging_{};
+    RunResourceSlots<RetainedGraphStaging> graph_definition_staging_;
     // Scheduler-state storage, one retained pair per pipeline slot — see
     // HostApi acquire_scheduler_state_storage and
     // utils/retained_scheduler_storage.h, which holds the grow, alignment and
     // failure rules.
-    std::array<RetainedSchedulerStorage, PTO_PIPELINE_MAX_DEPTH> scheduler_state_storage_{};
+    RunResourceSlots<RetainedSchedulerStorage> scheduler_state_storage_;
     // Host mirror of the runtime shared memory, one retained buffer per pipeline
     // slot — see HostApi acquire_sm_mirror. A host-side orchestrator writes its
     // whole shared-memory image here and the bind ships the live prefix, so the
@@ -700,7 +770,8 @@ protected:
         std::unique_ptr<std::byte[]> storage;
         size_t capacity{0};
     };
-    std::array<RetainedSmMirror, PTO_PIPELINE_MAX_DEPTH> sm_mirrors_{};
+    RunResourceSlots<std::shared_ptr<void>> orchestration_scratch_;
+    RunResourceSlots<RetainedSmMirror> sm_mirrors_;
 
     // Host staging for the device execution image, one retained buffer per
     // pipeline slot — see HostApi acquire_run_image_staging. Same block shape
@@ -710,7 +781,7 @@ protected:
     // afterwards, so this buffer is what makes the source outlive the
     // preparation. Sized to the image a bind ships rather than to the
     // mirror's capacity.
-    std::array<RetainedSmMirror, PTO_PIPELINE_MAX_DEPTH> run_image_stagings_{};
+    RunResourceSlots<RetainedSmMirror> run_image_stagings_;
 
     // Each arena bank backs the three pooled regions (GM heap / shared
     // shared memory / trb prebuilt runtime arena) for one pipeline slot. They
@@ -744,8 +815,31 @@ protected:
         size_t cached_gm_sm_size{0};
         size_t cached_runtime_arena_size{0};
     };
-    std::array<std::unique_ptr<ArenaBank>, PTO_PIPELINE_MAX_DEPTH> arena_banks_;
+    RunResourceSlots<std::unique_ptr<ArenaBank>> arena_banks_;
     ArenaBank &arena_bank(uint32_t bank_id) { return *arena_banks_[bank_id]; }
+    // How many run-resource sets every per-set container holds. Written last by
+    // `commit_run_resources`, so until a grant is published every bound check
+    // still answers for the previous one.
+    size_t granted_run_resource_sets_{0};
+
+    /** One built, unpublished grant: every per-set container's new storage. */
+    struct RunResourceStaging {
+        RunResourceSlots<void *>::Storage retained_temp_addrs;
+        RunResourceSlots<size_t>::Storage retained_temp_sizes;
+        RunResourceSlots<RetainedGraphStaging>::Storage graph_definition_staging;
+        RunResourceSlots<RetainedSchedulerStorage>::Storage scheduler_state_storage;
+        RunResourceSlots<std::shared_ptr<void>>::Storage orchestration_scratch;
+        RunResourceSlots<RetainedSmMirror>::Storage sm_mirrors;
+        RunResourceSlots<RetainedSmMirror>::Storage run_image_stagings;
+        RunResourceSlots<std::unique_ptr<ArenaBank>>::Storage arena_banks;
+        RunResourceSlots<HostPhaseRunState>::Storage host_phase_runs;
+        RunResourceSlots<DeviceRunResultRegion>::Storage device_run_results;
+    };
+
+    /** Allocate every per-set resource for `granted`; publishes nothing. */
+    RunResourceStaging build_run_resources(size_t granted);
+    /** Adopt a built grant by swapping every container. Never throws. */
+    void commit_run_resources(size_t granted, RunResourceStaging &&staged) noexcept;
     bool prebuilt_runtime_arena_cache_valid_{false};
     uint64_t prebuilt_runtime_arena_cache_hash_{0};
     std::vector<uint8_t> prebuilt_runtime_arena_cache_key_;
@@ -817,6 +911,11 @@ protected:
         void *host_orch_func_ptr{nullptr};
     };
     std::unordered_map<int32_t, CallableState> callables_;
+    // Held by every registration/unregistration entry point and by
+    // finalize_device. It makes an auto-ID scan and its claim atomic against
+    // an explicit-ID claim of the same slot; runs, initialization and destroy
+    // are serialized by their callers instead.
+    std::mutex callable_registration_mu_;
     std::unordered_set<int32_t> aicpu_seen_callable_ids_;
     size_t aicpu_dlopen_total_{0};
     size_t host_dlopen_total_{0};
@@ -849,7 +948,7 @@ protected:
     // in c_api_shared.cpp). The array keeps this storage the same shape as the
     // onboard base's, which is what lets the shared host-phase code index by
     // slot without a per-platform branch.
-    std::array<HostPhaseRunState, PTO_PIPELINE_MAX_DEPTH> host_phase_runs_{};
+    RunResourceSlots<HostPhaseRunState> host_phase_runs_;
     /**
      * One run's device-side terminal result, per pipeline slot.
      *
@@ -865,7 +964,7 @@ protected:
      * publishing run's epoch, so a slot still holding an earlier run's record
      * fails the epoch comparison rather than being mistaken for this run's.
      */
-    std::array<DeviceRunResultRegion, PTO_PIPELINE_MAX_DEPTH> device_run_results_{};
+    RunResourceSlots<DeviceRunResultRegion> device_run_results_;
     ArgsDumpCollector dump_collector_;
     PmuCollector pmu_collector_;
     ScopeStatsCollector scope_stats_collector_;

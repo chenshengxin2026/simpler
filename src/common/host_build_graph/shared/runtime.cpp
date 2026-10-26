@@ -35,6 +35,9 @@ Runtime::Runtime() {
     dev.aicpu_allowed_cpu_count = 0;
     dev.aicpu_launch_count = 0;
     dev.host_total_tasks = 0;
+    dev.graph_section_base = 0;
+    dev.graph_section_bytes = 0;
+    dev.graph_section_source = static_cast<uint32_t>(GraphSectionSource::None);
     dev.sm_image_bytes = 0;
     dev.gm_sm_ptr_ = nullptr;
     dev.prebuilt_arena_base_ = nullptr;
@@ -132,8 +135,8 @@ size_t runtime_device_initialized_prefix_size(const Runtime &) { return Runtime:
 
 size_t runtime_device_extent_size(const Runtime &) { return Runtime::device_extent_bytes(); }
 
-// Unsupported, so this runtime's host path keeps publishing the whole descriptor
-// prefix at prepare time and never builds a launch package.
+// Tensor arguments use the descriptor route, published on the launch stream.
+// Graph Definitions have their own launch-envelope section, independent of this plan.
 LaunchEntryArgsPlan runtime_launch_entry_args_plan(const Runtime &) { return LaunchEntryArgsPlan{}; }
 
 uint32_t runtime_graph_section_bytes(const Runtime &rt) { return rt.get_graph_section_bytes(); }

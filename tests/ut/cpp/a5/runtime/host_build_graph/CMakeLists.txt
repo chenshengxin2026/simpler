@@ -21,6 +21,34 @@ a5_hbg_case(test_hbg_scheduler_bootstrap.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu
     SOURCES  ${HBG_COMMON_SHARED_DIR}/runtime.cpp)
 
+a5_hbg_case(test_hbg_nonce_exit.cpp NO_OBJS TIMEOUT 20
+    SOURCES
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/aicore_executor.cpp
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/aicore_legacy_executor.cpp
+        ${SIMPLER_SRC}/a5/platform/shared/aicpu/platform_regs.cpp
+        ${SIMPLER_SRC}/a5/platform/sim/aicpu/inner_platform_regs.cpp
+        ${SIMPLER_SRC}/common/platform/sim/aicpu/device_time.cpp
+        ${SIMPLER_SRC}/common/platform/sim/aicpu/cache_ops.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/platform/sim/aicore ${SIMPLER_SRC}/common/platform/sim/aicpu)
+
+# Exercise the HBG owners against a recording retirement boundary. The platform
+# register tests separately drive the real ACK/close/read-back/drain sequence.
+if(APPLE)
+    set(_retirement_gc_link_option -Wl,-dead_strip)
+else()
+    set(_retirement_gc_link_option -Wl,--gc-sections)
+endif()
+a5_hbg_case(test_hbg_retirement_wiring.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu
+    SOURCES
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/runtime/scheduler/scheduler_cold_path.cpp
+        ${HBG_COMMON_SHARED_DIR}/runtime.cpp
+        ${SIMPLER_SRC}/common/platform/shared/aicpu/chip_swimlane_collector_aicpu.cpp
+        ${SIMPLER_SRC}/a5/platform/shared/aicpu/pmu_collector_aicpu.cpp
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections
+    LINK_OPTIONS ${_retirement_gc_link_option})
+
 # Drives the real orchestrator submit path.
 a5_hbg_case(test_hbg_submit_poison.cpp ORCH)
 

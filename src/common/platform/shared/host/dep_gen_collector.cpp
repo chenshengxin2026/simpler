@@ -49,8 +49,13 @@ DepGenCollector::~DepGenCollector() {
 
 int DepGenCollector::init(
     int num_threads, const DepGenAllocCallback &alloc_cb, DepGenRegisterCallback register_cb,
-    const DepGenFreeCallback &free_cb, int device_id
-) {
+    const DepGenFreeCallback &free_cb, int device_id, DepGenUnregisterCallback unregister_cb
+) try {
+    if (register_cb != nullptr && unregister_cb == nullptr) {
+        LOG_ERROR("DepGen collector registration requires an unregister callback");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+
     if (initialized_) {
         // Already holding this run's device resources. They are not per-run:
         // configuration arrives via begin_run() and the layout is fixed at
@@ -78,14 +83,16 @@ int DepGenCollector::init(
     // allocation succeeds — start(tf) gates on shm_host_.
     set_memory_context(
         alloc_cb, register_cb, free_cb, profiling_copy_to_device_or_null(), profiling_copy_from_device_or_null(),
-        /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id
+        /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id, unregister_cb
     );
 
     // RAII rollback: any early return after this point releases the shm
     // region + every DepGenBuffer (device pointer + malloc'd host shadow)
     // tracked by the manager. `guard.commit()` runs on the success path
     // before the trailing return 0.
-    profiling_common::InitRollbackGuard<decltype(manager_)> guard(manager_, free_cb);
+    profiling_common::InitRollbackGuard<decltype(manager_)> guard(
+        manager_, free_cb, register_cb != nullptr ? unregister_cb : nullptr, device_id
+    );
 
     // ---- Allocate shared header + buffer-state region ----
     // dep_gen is single-instance: just one DepGenBufferState after the header.
@@ -132,29 +139,20 @@ int DepGenCollector::init(
 
     // Push the entire initialized shm region (header + BufferState +
     // free_queue contents) to device.
-    profiling_copy_to_device(shm_dev_local, shm_host_local, shm_size);
+    if (int rc = profiling_copy_to_device(shm_dev_local, shm_host_local, shm_size); rc != 0) return rc;
 
     LOG_INFO(
         "DepGen collector initialized: %d threads, SHM=0x%lx (records held in memory until replay)", num_threads,
         reinterpret_cast<unsigned long>(shm_dev_local)
     );
     guard.commit();
-    // Publish members + memory context only after the rollback guard is
-    // disarmed; initialized_ is published last. set_memory_context copy-assigns
-    // std::function members and can throw std::bad_alloc, so keeping it (and the
-    // initialized_ store) before commit would let the guard free the shm/buffers
-    // on unwind while initialized_ is already true — finalize() would then skip
-    // its !initialized_ early-return and double-free what the guard released.
-    // start(tf) gates on shm_host_ (published by set_memory_context), so this is
-    // the moment the collector becomes startable.
     shm_dev_ = shm_dev_local;
     shm_size_ = shm_size;
-    set_memory_context(
-        alloc_cb, register_cb, free_cb, profiling_copy_to_device_or_null(), profiling_copy_from_device_or_null(),
-        shm_dev_local, shm_host_local, shm_size, device_id
-    );
+    publish_shared_memory(shm_dev_local, shm_host_local, shm_size);
     initialized_ = true;
     return 0;
+} catch (const std::bad_alloc &) {
+    return PTO_RUNTIME_ERR_INTERNAL;
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +449,8 @@ void DepGenCollector::finalize(DepGenUnregisterCallback unregister_cb, const Dep
         std::scoped_lock lock(records_mutex_);
         records_by_run_.clear();
     }
+
+    if (!validate_release_callbacks(unregister_cb, free_cb)) return;
 
     auto release_dev = [&](void *p) {
         release_one_buffer(p, unregister_cb, free_cb);

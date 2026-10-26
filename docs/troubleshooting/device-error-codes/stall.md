@@ -51,10 +51,19 @@ reaped can be read without reproducing it:
 kernel, on which core". The `SUMMARY` line beside them gives `completed=x/y` and the
 iteration progress last happened on.
 
-Lowering the threshold to **DEBUG** adds the *periodic* rounds the scheduler emits
-every `STALL_LOG_INTERVAL` idle iterations while a stall is still building. Those
-rounds are what show whether the pending set was changing or frozen from the start —
-the shutdown snapshot alone shows only the final state.
+At **INFO** or **DEBUG**, each scheduler thread emits one local `CLUSTER` snapshot
+when its continuous no-progress time reaches half the scheduler timeout. The
+snapshot includes that thread's cores, running tasks, kernels and COND state.
+Progress on that thread rearms its warning; other threads neither suppress nor
+rearm it. With INFO disabled, the logging backend filters out these messages.
+
+Local warnings do not scan shared task rings, acquire the AsyncWaitList lock, or
+coordinate through a shared warning latch. Global `TASK`/`SUMMARY` and `ASYNC_WAIT`
+reports are reserved for the final shutdown snapshot, whose winner emits all
+threads' cluster state and bounded async-wait details at **WARN**. Tensor-data
+wait timeouts use this same final snapshot with `reason=tensor_data_timeout`;
+scheduler timeouts use `reason=scheduler_timeout`. A5 RDMA diagnostic details also
+use WARN. The original fatal error remains at ERROR.
 
 Setting the level:
 

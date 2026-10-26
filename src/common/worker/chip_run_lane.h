@@ -13,11 +13,12 @@
 
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <memory>
 
 #include "../task_interface/call_config.h"
 #include "../task_interface/task_args.h"
-#include "pipeline_slot_pool.h"
+#include "run_resource_arena.h"
 
 class ChipWorker;
 struct ChipRunLaneState;
@@ -66,11 +67,13 @@ public:
     ChipRun submit(
         int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, const PipelineSlotLease &lease,
         uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0,
-        bool activated = true
+        bool activated = true, NativeRunProvenance provenance = {}
     );
+    // A non-null caller stream requires actual enqueue before a successful
+    // return. Stream work appended after that return is ordered after both kernels.
     ChipRun submit(
         int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
-        volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0
+        volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0, void *caller_stream = nullptr
     );
 
     void drain();
@@ -96,5 +99,7 @@ public:
     bool poisoned() const;
 
 private:
+    friend class ChipWorker;
+    void detach_after_failed_teardown(std::exception_ptr error) noexcept;
     std::shared_ptr<ChipRunLaneState> state_;
 };

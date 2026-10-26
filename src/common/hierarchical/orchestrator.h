@@ -45,7 +45,7 @@
 #include "../task_interface/data_type.h"
 #include "../task_interface/task_args_wire.h"
 #include "../task_interface/tensor.h"
-#include "../worker/pipeline_slot_pool.h"
+#include "../worker/run_resource_arena.h"
 #include "../worker/device_memory_info.h"
 #include "worker_manager.h"
 #include "ring.h"
@@ -159,8 +159,10 @@ public:
      * it does not bound terminal runs whose `RunState` a caller has not yet
      * released.
      *
-     * `pending_depth == 0` derives the FIFO bound from `depth`, which is the
-     * behaviour every caller had before the two budgets were separable. A
+     * `initial_admission_depth` narrows the initial usable prefix without
+     * reducing the identity directory; zero uses all of `depth`. Automatic
+     * admission starts at one until endpoint reports prove further capacity.
+     * `pending_depth == 0` follows that usable prefix. A
      * positive value below `depth` is legal and simply leaves the successor
      * role unfillable, because that role needs a second FIFO entry to exist.
      *
@@ -172,7 +174,43 @@ public:
      * still executing. It cannot exceed `depth`, since a launched run holds a
      * pipeline lease for its whole lifetime.
      */
-    void configure_pipeline_depth(uint32_t depth, uint32_t pending_depth = 0, uint32_t launch_depth = 1);
+    void configure_pipeline_depth(
+        uint32_t depth, uint32_t pending_depth = 0, uint32_t launch_depth = 1, uint32_t initial_admission_depth = 0
+    );
+
+    /**
+     * Narrow or widen what future admissions may take, from what the workers
+     * have proved they can hold.
+     *
+     * Unlike `configure_pipeline_depth` this is legal at any time and changes
+     * no table: the lease pool is already sized to the grant, and this only
+     * moves the prefix of it `try_acquire` scans. So a decrease confines the
+     * next acquisition and nothing else — a lease already granted stays valid,
+     * its run keeps its slot, and admission simply waits until the queue drains
+     * below the new figure. No record, result or output is dropped.
+     *
+     * Clamped into `[1, grant]`: a context always holds the run it is
+     * executing, and it can never hold more sets than it was granted.
+     *
+     * @param sets what the workers jointly report they can hold
+     */
+    void update_admissible_depth(uint32_t sets);
+
+    /** What future admissions may currently take. */
+    uint32_t admissible_depth() const;
+
+    /**
+     * Record what one endpoint reports it can hold.
+     *
+     * Kept rather than applied: a run reaches its terminal on each endpoint
+     * separately, and acting on the first report would widen admission before
+     * the tighter endpoint has spoken. The reports are folded together when the
+     * whole run retires, which is the one point at which every endpoint that
+     * executed any of its tasks has reported for it.
+     *
+     * Zero is "no report" and changes nothing.
+     */
+    void note_endpoint_capacity(int32_t worker_id, uint32_t sets);
     void close_run_submission(RunId run_id);
     void fail_run_submission(RunId run_id, std::exception_ptr error = nullptr);
     void wait_run_accepted(RunId run_id);
@@ -214,6 +252,11 @@ public:
      * `preparable_run_id` reports.
      */
     std::vector<RunId> preparable_run_ids() const;
+
+    // Scheduler-only: staging must follow every earlier run's publication on
+    // this endpoint, including its dependency-blocked singles and groups.
+    // The scheduler loop mutex keeps RUNNING claims and publication indivisible.
+    bool can_stage_run_on_worker(RunId run_id, int32_t worker_id) const;
 
     /**
      * Every staged successor authorized to launch early, in FIFO order.
@@ -299,6 +342,8 @@ public:
     size_t begin_run_waiter_count_for_test() const;
 
 private:
+    bool apply_admissible_depth_locked(uint32_t sets);
+
     TensorMap *tensormap_ = nullptr;
     Ring *allocator_ = nullptr;
     Scope *scope_ = nullptr;
@@ -312,25 +357,34 @@ private:
     std::condition_variable runs_cv_;
     std::unordered_map<RunId, std::shared_ptr<RunState>> runs_;
     std::deque<RunId> run_fifo_;
-    // The standing default, not the layout ceiling: an Orchestrator nobody
-    // configured admits what every Orchestrator admitted before the count
-    // could be requested. `configure_pipeline_depth` is what carries a granted
-    // capacity here, and the pool is sized to the ceiling so that call can
-    // raise the admission bound without rebuilding it.
-    PipelineSlotPool pipeline_slots_{PTO_PIPELINE_MAX_DEPTH};
+    // The standing default, not a layout ceiling: an Orchestrator nobody
+    // configured admits what every Orchestrator admitted before the count could
+    // be requested. `configure_pipeline_depth` carries a granted capacity here
+    // and rebuilds the arena to it, which it may do because it refuses once
+    // admission has started.
+    RunResourceArena run_resources_{kDefaultRunResourceSets};
     uint32_t admission_depth_{kDefaultRunResourceSets};
     // How many non-terminal runs `run_fifo_` may hold. Derived from
     // `admission_depth_` unless a caller configured it, so the default admits
     // exactly the runs a lease was available for before the two budgets split.
     uint32_t pending_run_limit_{kDefaultRunResourceSets};
+    // Whether a caller chose the queue bound. An automatic capacity report
+    // moves the bound it derives, and must not overwrite a figure a caller set.
+    bool pending_run_limit_configured_{false};
+    // What each endpoint last reported it can hold, by worker id. Folded by
+    // `min` at whole-run retirement: one lease names a slot on every endpoint,
+    // so the tightest endpoint is what the context can actually admit. An
+    // endpoint that has never reported is absent and constrains nothing, which
+    // is safe because the depth starts at one and only a fold moves it.
+    std::unordered_map<int32_t, uint32_t> endpoint_capacity_;
     // How many runs may have their device work launched at once. One is the
-    // serial behaviour, and at one nothing below reads
-    // `early_launch_run_id_`, which stays invalid.
+    // serial behaviour, and at one nothing below authorizes an early launch.
     uint32_t launch_depth_{1};
-    // The staged successor currently authorized to launch early, latched so
-    // the transition into that state can be announced once rather than
-    // re-derived by every reader.
-    RunId early_launch_run_id_{INVALID_RUN_ID};
+    // Which runs were already authorized to launch early. Not the answer to
+    // "who may launch" — that is `early_launch_prefix_locked`, recomputed on
+    // demand — only the comparison that says which transition authorized
+    // someone new and therefore owes the scheduler a wake.
+    std::vector<RunId> early_launch_authorized_;
     RunId next_run_id_{1};
     RunId building_run_id_{INVALID_RUN_ID};
     RunId active_run_id_{INVALID_RUN_ID};
@@ -364,6 +418,8 @@ private:
      * slot this call would wait for.
      */
     bool acquire_lease_locked(const std::shared_ptr<RunState> &run, bool *assigned = nullptr);
+    /** The tightest endpoint report, or 0 when no endpoint has reported. */
+    uint32_t folded_endpoint_capacity_locked() const;
 
     /**
      * Hand leases to the two roles that may hold one: the FIFO head and the
@@ -390,9 +446,8 @@ private:
     static bool all_dispatches_accepted(const std::shared_ptr<RunState> &run);
 
     /**
-     * Re-derive `early_launch_run_id_`, reporting whether this call is the one
-     * that authorized a run. The caller owes the scheduler a wake on true,
-     * issued outside `runs_mu_`.
+     * Recompute the authorized early-launch prefix and report whether it added
+     * a run. The caller owes the scheduler a wake on true, outside `runs_mu_`.
      *
      * Called at every transition that can change the answer: the last
      * acceptance arriving, submission closing, a lease refresh at retirement,
@@ -401,6 +456,12 @@ private:
      * endpoint's staging event.
      */
     bool refresh_early_launch_locked();
+    /** Callers hold `runs_mu_`; return the first currently authorized successor. */
+    RunId early_launch_first_locked() const;
+    /** Callers hold `runs_mu_`; return the authorized successor after a FIFO index. */
+    RunId early_launch_successor_locked(size_t predecessor_index) const;
+    /** The FIFO prefix authorized to launch early right now; `runs_mu_` is held. */
+    std::vector<RunId> early_launch_prefix_locked() const;
     void activate_fifo_head();
     void retire_terminal_run(const std::shared_ptr<RunState> &run);
     void cancel_unstarted_run(const std::shared_ptr<RunState> &run, const std::string &message);

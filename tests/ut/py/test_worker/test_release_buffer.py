@@ -309,17 +309,21 @@ class _FakeChipImpl:
 
     def __init__(self):
         self.calls: list[tuple[int, object, object]] = []
+        self._execution_environment = None
 
     def _submit_chip_run_direct(self, callable_id, chip_args, cfg):
         self.calls.append((callable_id, chip_args, cfg))
         return SimpleNamespace(wait=lambda timeout: True)
+
+    def _validate_execution_context(self):
+        pass
 
 
 def _l2_with_registered_buffer(nbytes: int = 64):
     """An L2 Worker (its own chip, no fork needed) plus one buffer already registered in
     w._buffers, the way Worker.create_buffer() would leave it."""
     w = Worker(level=2)
-    w._chip_worker = SimpleNamespace(_impl=_FakeChipImpl())
+    w._chip_worker = _FakeChipImpl()
     buf = w._create_buffer_locked(nbytes)
     return w, buf
 
@@ -363,7 +367,7 @@ class TestL2TouchedIdentityTracking:
                 proceed.wait(timeout=5)
                 return super()._submit_chip_run_direct(callable_id, chip_args, cfg)
 
-        w._chip_worker = SimpleNamespace(_impl=_BlockingChipImpl())
+        w._chip_worker = _BlockingChipImpl()
 
         submit_thread = threading.Thread(target=lambda: w._submit_l2_locked(3, _buffer_args(buf), CallConfig()))
         submit_thread.start()

@@ -209,11 +209,11 @@ class TestRunStreamReuseHbg(SceneTestCase):
         self.compute_golden(golden_args, params, subtract=subtract)
         chip_args, output_names = _build_chip_task_args(test_args, self.CALLABLE["orchestration"]["signature"])
         state = worker._resolve_handle(handle)
-        worker._chip_worker._run_slot_with_pipeline_lease(
+        worker._chip_worker._run_with_pipeline_lease(
             state.slot_id,
             chip_args,
-            slot_id,
-            generation,
+            slot_id=slot_id,
+            generation=generation,
             config=self._build_config(self.CASES[0].get("config", {})),
         )
         _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
@@ -403,7 +403,7 @@ class TestRunStreamReuseHbg(SceneTestCase):
     def test_unleased_runs_do_not_consume_lease_generations(self, st_platform, st_worker):
         """A slot pool's first lease is admitted however many runs precede it.
 
-        `PipelineSlotPool` is the only mint, and it starts every slot at
+        `RunResourceArena` is the only mint, and it starts every set at
         generation 1. A consumer that minted generations for its own unleased
         runs would have advanced past that, and the first real lease it was
         ever handed would be rejected as stale. This needs a worker whose

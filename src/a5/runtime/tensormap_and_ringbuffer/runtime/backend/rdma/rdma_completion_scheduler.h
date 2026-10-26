@@ -212,7 +212,7 @@ inline bool is_cq_ctx_valid(const RdmaCqCtx &cq_ctx, uint32_t cqe_size) {
 }
 
 inline void log_rdma_wq_snapshot(const char *queue_name, const RdmaWqCtx &wq_ctx, int32_t entry_idx, int32_t cond_idx) {
-    LOG_INFO(
+    LOG_WARN(
         "[ASYNC_WAIT RDMA entry=%d cond=%d] %s wqn=%u depth=%u wqe_size=%u head=%u tail=%u db_sw_be=0x%x "
         "buf=0x%llx head_addr=0x%llx tail_addr=0x%llx db_hw=0x%llx db_sw=0x%llx mtu_shift=%u",
         entry_idx, cond_idx, queue_name, wq_ctx.wqn, wq_ctx.depth, wq_ctx.wqe_size,
@@ -227,7 +227,7 @@ inline void log_rdma_wq_snapshot(const char *queue_name, const RdmaWqCtx &wq_ctx
 inline void log_rdma_mem_snapshot(
     const char *mem_name, const RdmaMemInfo &mem, uint32_t rank, int32_t entry_idx, int32_t cond_idx
 ) {
-    LOG_INFO(
+    LOG_WARN(
         "[ASYNC_WAIT RDMA entry=%d cond=%d] %s rank=%u addr=0x%llx size=%llu lkey=0x%x rkey=0x%x", entry_idx, cond_idx,
         mem_name, rank, static_cast<unsigned long long>(mem.addr), static_cast<unsigned long long>(mem.size), mem.lkey,
         mem.rkey
@@ -253,7 +253,7 @@ inline void log_rdma_wqe_snapshot(
     const uint64_t word5 = __atomic_load_n(&wqe[5], __ATOMIC_ACQUIRE);
     const uint64_t word6 = __atomic_load_n(&wqe[6], __ATOMIC_ACQUIRE);
     const uint64_t word7 = __atomic_load_n(&wqe[7], __ATOMIC_ACQUIRE);
-    LOG_INFO(
+    LOG_WARN(
         "[ASYNC_WAIT RDMA entry=%d cond=%d] %s wqe index=%u addr=0x%llx raw64="
         "0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx",
         entry_idx, cond_idx, queue_name, wqe_index, static_cast<unsigned long long>(wqe_addr),
@@ -282,7 +282,7 @@ inline void log_rdma_cqe_snapshot(
     constexpr uint32_t kCqeOpcodeMask = 0x1f;
     const bool owner = (owner_id_qpn & (1u << kOwnerShift)) != 0;
     const uint32_t cqe_type = (op_sr_wqebb >> kCqeOpcodeShift) & kCqeOpcodeMask;
-    LOG_INFO(
+    LOG_WARN(
         "[ASYNC_WAIT RDMA entry=%d cond=%d] %s cqe addr=0x%llx owner=%u ready=%u type=0x%x "
         "owner_id_qpn=0x%x op_sr_wqebb=0x%x syndrome=0x%x",
         entry_idx, cond_idx, queue_name, static_cast<unsigned long long>(cqe_addr), static_cast<unsigned>(owner),
@@ -298,7 +298,7 @@ inline void log_rdma_cq_snapshot(
     const uint32_t cur_head = load_device_u32_or_zero(cq_ctx.head_addr);
     const uint32_t cur_tail = load_device_u32_or_zero(cq_ctx.tail_addr);
     const bool ctx_valid = is_cq_ctx_valid(cq_ctx, cqe_size);
-    LOG_INFO(
+    LOG_WARN(
         "[ASYNC_WAIT RDMA entry=%d cond=%d] %s cqn=%u depth=%u cqe_size=%u cur_head=%u cur_tail=%u target_head=%u "
         "db_sw_be=0x%x cq_buf=0x%llx cq_head=0x%llx cq_tail=0x%llx cq_db_sw=0x%llx valid=%u",
         entry_idx, cond_idx, queue_name, cq_ctx.cqn, cq_ctx.depth, cqe_size, cur_head, cur_tail, target_head,
@@ -470,7 +470,7 @@ log_rdma_event_handle_snapshot(uint64_t event_handle, uint64_t workspace_addr, i
     uint32_t dest_rank = 0;
     uint32_t target_head = 0;
     decode_rdma_event_handle(event_handle, dest_rank, target_head);
-    LOG_INFO(
+    LOG_WARN(
         "[ASYNC_WAIT RDMA entry=%d cond=%d] handle=0x%llx workspace=0x%llx dest_rank=%u target_head=%u", entry_idx,
         cond_idx, static_cast<unsigned long long>(event_handle), static_cast<unsigned long long>(workspace_addr),
         dest_rank, target_head
@@ -492,7 +492,7 @@ log_rdma_event_handle_snapshot(uint64_t event_handle, uint64_t workspace_addr, i
     const uint64_t scq_ptr = __atomic_load_n(&info->scq_ptr, __ATOMIC_ACQUIRE);
     const uint64_t rcq_ptr = __atomic_load_n(&info->rcq_ptr, __ATOMIC_ACQUIRE);
     const uint64_t mem_ptr = __atomic_load_n(&info->mem_ptr, __ATOMIC_ACQUIRE);
-    LOG_INFO(
+    LOG_WARN(
         "[ASYNC_WAIT RDMA entry=%d cond=%d] info magic=0x%x version=%u backend=%u qp_num=%u rank_count=%u "
         "sq=0x%llx rq=0x%llx scq=0x%llx rcq=0x%llx mem=0x%llx",
         entry_idx, cond_idx, magic, version, backend, qp_num, rank_count, static_cast<unsigned long long>(sq_ptr),

@@ -9,7 +9,13 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <cerrno>
+#include <csignal>
+#include <functional>
 #include <array>
 #include <chrono>
 #include <condition_variable>
@@ -24,7 +30,7 @@
 #include <vector>
 
 #include "call_config.h"
-#include "pipeline_slot_pool.h"
+#include "run_resource_arena.h"
 #include "runtime_c_api.h"
 #include "task_args.h"
 #include "types.h"
@@ -41,10 +47,13 @@ namespace {
 std::unordered_map<void *, uint32_t> g_slots;
 std::array<bool, 2> g_complete{};
 std::array<int, 2> g_prepare_rc{};
+bool g_prepare_release_proven{true};
 std::array<int, 2> g_launch_rc{};
 std::array<int, 2> g_poll_rc{};
 std::array<int, 2> g_wait_rc{};
 std::array<int, 2> g_finalize_rc{};
+std::array<bool, 2> g_finalize_no_submission{};
+std::array<uint64_t, 2> g_epochs{};
 std::array<size_t, 2> g_prepare_count{};
 std::array<bool, 2> g_reject_first_prepare{};
 size_t g_poll_count{0};
@@ -66,10 +75,14 @@ int prepare_run(
 ) {
     EXPECT_EQ(slot_of(runtime), descriptor->pipeline_slot);
     g_complete[descriptor->pipeline_slot] = false;
+    g_epochs[descriptor->pipeline_slot] = descriptor->run_epoch;
     g_events.push_back("prepare" + std::to_string(descriptor->pipeline_slot));
     ++g_prepare_count[descriptor->pipeline_slot];
     if (g_reject_first_prepare[descriptor->pipeline_slot] && g_prepare_count[descriptor->pipeline_slot] == 1) {
         return PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE;
+    }
+    if (g_prepare_rc[descriptor->pipeline_slot] != 0 && g_prepare_release_proven) {
+        publish_released_preparation(runtime, descriptor->run_epoch);
     }
     return g_prepare_rc[descriptor->pipeline_slot];
 }
@@ -106,6 +119,9 @@ int wait_run(void *, void *runtime) {
 int finalize_run(void *, void *runtime) {
     const uint32_t slot = slot_of(runtime);
     g_events.push_back("finalize" + std::to_string(slot));
+    if (g_finalize_no_submission[slot] && g_finalize_rc[slot] == 0) {
+        publish_released_preparation(runtime, g_epochs[slot]);
+    }
     return g_finalize_rc[slot];
 }
 
@@ -115,10 +131,13 @@ void prime_worker(ChipWorker &worker) {
     g_slots.clear();
     g_complete = {};
     g_prepare_rc = {};
+    g_prepare_release_proven = true;
     g_launch_rc = {};
     g_poll_rc = {};
     g_wait_rc = {};
     g_finalize_rc = {};
+    g_finalize_no_submission = {};
+    g_epochs = {};
     g_prepare_count = {};
     g_reject_first_prepare = {};
     g_poll_count = 0;
@@ -132,8 +151,12 @@ void prime_worker(ChipWorker &worker) {
     g_events.clear();
     worker.initialized_ = true;
     worker.pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 2, {}};
-    worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t));
-    worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t));
+    // One generation per granted set, as `init` sizes it: an unsized filter has no entry for
+    // slot 0, and `is_admissible` refuses a lease outside it, so every preparation would be
+    // refused as stale before reaching the stubs below.
+    worker.pipeline_generations_.resize(2);
+    worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t), nullptr);
+    worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t), nullptr);
     for (uint32_t slot = 0; slot < worker.runtime_bufs_.size(); ++slot) {
         g_slots.emplace(worker.runtime_bufs_[slot].data(), slot);
     }
@@ -448,7 +471,7 @@ TEST(ChipRunLaneTest, PrepareFailureIsTerminalWithoutPoisoningTheLane) {
 
     ChipRun failed = submit(lane, 101, 0);
     EXPECT_TRUE(failed.done());
-    EXPECT_THROW(failed.wait_until(ChipRunLane::Deadline::max()), std::runtime_error);
+    EXPECT_THROW(failed.wait_until(ChipRunLane::Deadline::max()), RunPreparationRefused);
     EXPECT_FALSE(lane.poisoned());
 
     ChipRun successor = submit(lane, 102, 1);
@@ -475,6 +498,51 @@ TEST(ChipRunLaneTest, ReclaimedLaunchFailureDoesNotPoisonTheLane) {
     g_complete[1] = true;
     EXPECT_TRUE(successor.done());
     lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, UnstartedLaunchReleasePreservesTheOriginalErrorAndAllowsRetry) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    g_launch_rc[0] = -6;
+    g_poll_rc[0] = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    g_finalize_no_submission[0] = true;
+
+    ChipRun failed = submit(lane, 101, 0);
+    EXPECT_TRUE(failed.done());
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        try {
+            failed.wait_until(ChipRunLane::Deadline::max());
+            FAIL() << "launch failure was discarded";
+        } catch (const RunPreparationRefused &error) {
+            EXPECT_NE(std::string(error.what()).find("launch_native_run failed with code -6"), std::string::npos);
+        }
+    }
+    EXPECT_FALSE(lane.poisoned());
+    ChipRun successor = submit(lane, 102, 1);
+    EXPECT_TRUE(successor.launched());
+    g_complete[1] = true;
+    EXPECT_TRUE(successor.done());
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, MissingUnstartedReleaseProofKeepsTheFailurePoisoned) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    g_launch_rc[0] = -6;
+    g_poll_rc[0] = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    ChipRun failed = submit(lane, 101, 0);
+    try {
+        failed.wait_until(ChipRunLane::Deadline::max());
+        FAIL() << "expected a terminal launch error";
+    } catch (const RunPreparationRefused &) {
+        FAIL() << "missing cleanup proof permitted input release";
+    } catch (const std::runtime_error &) {}
+    EXPECT_TRUE(lane.poisoned());
+    EXPECT_THROW(lane.close(), std::runtime_error);
     worker.finalize();
 }
 
@@ -629,4 +697,203 @@ TEST(ChipRunLaneTest, CloseDrainsAndRejectsNewSubmissions) {
         lane.submit(1, args, CallConfig{}, PipelineSlotLease{1, 0, 102}, 102, 102, nullptr, 0, true), std::runtime_error
     );
     worker.finalize();
+}
+
+TEST(ChipRunLaneTest, UnknownPreparationCleanupPoisonsAndKeepsTheReleaseUnproven) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    g_prepare_rc[0] = -5;
+    g_prepare_release_proven = false;
+    ChipRun failed = submit(lane, 101, 0);
+    EXPECT_TRUE(failed.done());
+    try {
+        failed.wait_until(ChipRunLane::Deadline::max());
+        FAIL() << "unknown cleanup must fail";
+    } catch (const RunPreparationRefused &) {
+        FAIL() << "missing release receipt must not supply an input lifetime proof";
+    } catch (const std::runtime_error &) {}
+    EXPECT_TRUE(lane.poisoned());
+    EXPECT_THROW(submit(lane, 102, 1), std::runtime_error);
+    EXPECT_THROW(lane.close(), std::runtime_error);
+    EXPECT_NO_THROW(worker.finalize());
+}
+
+TEST(ChipRunLaneTest, ReleasedPrepareReceiptIsBoundToOneEpochAndConsumedOnce) {
+    alignas(8) uint64_t storage[2]{};
+    publish_released_preparation(storage, 7);
+    EXPECT_FALSE(consume_released_preparation(storage, sizeof(storage), 8));
+    EXPECT_FALSE(consume_released_preparation(storage, sizeof(uint64_t), 7));
+    EXPECT_TRUE(consume_released_preparation(storage, sizeof(storage), 7));
+    EXPECT_FALSE(consume_released_preparation(storage, sizeof(storage), 7));
+    EXPECT_EQ(storage[0], 0u);
+    EXPECT_EQ(storage[1], 0u);
+    EXPECT_FALSE(consume_released_preparation(nullptr, sizeof(storage), 7));
+}
+
+namespace {
+
+// The parent's waiter owns the lane mutex until after the child exits.
+int fork_with_lane_locked(ChipRun &run, const std::function<void()> &child_operation) {
+    {
+        std::lock_guard<std::mutex> lk(g_wait_mu);
+        g_release_wait = false;
+    }
+    std::exception_ptr wait_error;
+    std::thread waiter([&] {
+        try {
+            (void)run.wait_until(ChipRun::Deadline::max());
+        } catch (...) {
+            wait_error = std::current_exception();
+        }
+    });
+    bool entered = false;
+    {
+        std::unique_lock<std::mutex> lk(g_wait_mu);
+        entered = g_wait_cv.wait_for(lk, std::chrono::seconds(5), [] {
+            return g_wait_entered;
+        });
+    }
+    pid_t child = -1;
+    int status = -1;
+    if (entered) {
+        child = fork();
+        if (child == 0) {
+            alarm(2);
+            try {
+                child_operation();
+                _exit(0);
+            } catch (...) {
+                _exit(1);
+            }
+        }
+        if (child > 0) {
+            pid_t waited;
+            do {
+                waited = waitpid(child, &status, 0);
+            } while (waited == -1 && errno == EINTR);
+            EXPECT_EQ(waited, child);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_wait_mu);
+        g_release_wait = true;
+    }
+    g_wait_cv.notify_all();
+    waiter.join();
+    EXPECT_TRUE(entered);
+    EXPECT_GT(child, 0);
+    EXPECT_EQ(wait_error, nullptr);
+    return status;
+}
+
+void require_process_refusal(const std::function<void()> &operation) {
+    try {
+        operation();
+    } catch (const ExecutionContextRefused &) {
+        return;
+    }
+    throw std::runtime_error("inherited lane operation did not refuse its process");
+}
+
+}  // namespace
+
+TEST(ChipRunLaneTest, ForkedHandlesRefuseBeforeTakingAnInheritedMutex) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    ChipRun completed = submit(lane, 1, 0);
+    g_complete[0] = true;
+    ASSERT_TRUE(completed.done());
+    ChipRun run = submit(lane, 2, 0);
+    const int status = fork_with_lane_locked(run, [&] {
+        const auto events = g_events;
+        for (ChipRun *handle : {&run, &completed}) {
+            require_process_refusal([&] {
+                (void)handle->done();
+            });
+            require_process_refusal([&] {
+                (void)handle->wait_until(ChipRun::Clock::now());
+            });
+            require_process_refusal([&] {
+                handle->activate();
+            });
+            require_process_refusal([&] {
+                handle->abandon();
+            });
+            require_process_refusal([&] {
+                (void)handle->launched();
+            });
+            require_process_refusal([&] {
+                (void)handle->lane_poisoned();
+            });
+            require_process_refusal([&] {
+                (void)handle->preparation_disposition();
+            });
+        }
+        if (events != g_events) throw std::runtime_error("child entered the runtime");
+    });
+    ASSERT_TRUE(WIFEXITED(status)) << "child status=" << status;
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+    EXPECT_TRUE(run.done());
+    ChipRun next = submit(lane, 3, 0);
+    g_complete[0] = true;
+    EXPECT_TRUE(next.done());
+}
+
+TEST(ChipRunLaneTest, ForkedLaneRefusesBeforeTakingAnInheritedMutex) {
+    ChipWorker worker;
+    prime_worker(worker);
+    auto lane = std::make_unique<ChipRunLane>(worker);
+    ChipRun run = submit(*lane, 1, 0);
+    const int status = fork_with_lane_locked(run, [&] {
+        const auto events = g_events;
+        require_process_refusal([&] {
+            (void)submit(*lane, 2, 1);
+        });
+        require_process_refusal([&] {
+            (void)lane->submit(1, ChipStorageTaskArgs{}, CallConfig{});
+        });
+        require_process_refusal([&] {
+            lane->drain();
+        });
+        require_process_refusal([&] {
+            lane->close();
+        });
+        require_process_refusal([&] {
+            (void)lane->poisoned();
+        });
+        lane->stop_admission();
+        lane.reset();
+        if (events != g_events) throw std::runtime_error("child entered the runtime");
+    });
+    ASSERT_TRUE(WIFEXITED(status)) << "child status=" << status;
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+    ChipRun next = submit(*lane, 2, 0);
+    g_complete[0] = true;
+    EXPECT_TRUE(next.done());
+}
+
+TEST(ChipRunLaneTest, ForkedWorkerDestructionDoesNotDetachAnInheritedLane) {
+    auto worker = std::make_unique<ChipWorker>();
+    prime_worker(*worker);
+    worker->execution_environment_ = ChipWorker::ExecutionEnvironment{static_cast<uint64_t>(getpid()), 1, 1, 0, false};
+    worker->run_lane_ = std::make_unique<ChipRunLane>(*worker);
+    ChipRun run = submit(*worker->run_lane_, 1, 0);
+    const int status = fork_with_lane_locked(run, [&] {
+        const auto events = g_events;
+        worker.reset();
+        require_process_refusal([&] {
+            (void)run.done();
+        });
+        if (events != g_events) throw std::runtime_error("child entered the runtime");
+    });
+    ASSERT_TRUE(WIFEXITED(status)) << "child status=" << status;
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+    EXPECT_TRUE(run.done());
+    EXPECT_TRUE(worker->execution_environment_.has_value());
+    ChipRun next = submit(*worker->run_lane_, 2, 0);
+    g_complete[0] = true;
+    EXPECT_TRUE(next.done());
+    worker->finalize();
 }

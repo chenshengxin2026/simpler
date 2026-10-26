@@ -174,7 +174,7 @@ public:
 
     int init(
         int num_threads, const ScopeStatsAllocCallback &alloc_cb, ScopeStatsRegisterCallback register_cb,
-        const ScopeStatsFreeCallback &free_cb, int device_id
+        const ScopeStatsFreeCallback &free_cb, int device_id, ScopeStatsUnregisterCallback unregister_cb = nullptr
     );
 
     // Start a run's collection window: drop the previous run's records, its

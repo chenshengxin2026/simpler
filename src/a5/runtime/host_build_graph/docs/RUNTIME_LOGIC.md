@@ -32,7 +32,7 @@ shared object, opens it with `dlopen(RTLD_LOCAL)`, and resolves:
 
 - `aicpu_orchestration_config`;
 - `aicpu_orchestration_entry`; and
-- `framework_bind_runtime`.
+- `framework_bind_orch_context`.
 
 The resolved handle and entry points belong to the registered callable and stay
 alive across prepared runs. Unregister/context teardown closes the handle and
@@ -52,6 +52,33 @@ For each run, the host:
 5. finalizes task counts and records the prepared metadata sources in Runtime's host-only pending publication;
 6. returns from bind, then synchronously publishes Definitions, any resident
    scheduler state, and finally the shared-memory image with the copied zone.
+
+The exclusive pipeline slot retains only `OrchestrationScratch`: TensorMap
+arrays and the fan-in epoch array. Each bind owns a fresh `OrchestratorState`,
+borrows those arrays, and returns them after Graph recorder teardown on every
+exit. Fatal state, counters, mirror/heap pointers and Graph bindings belong to
+that run. A bind also holds a local owning reference. `ChipWorker::finalize()`
+drains native runs, finalizes and destroys the runner, and only then closes
+`host_runtime.so`, which owns the scratch deleter and shared-pointer control-block
+code. A failed device finalization retains both the runner and module for retry.
+Callable and executor libraries closed inside runner finalization are separate
+modules. `HostApiOps` is host-only: all providers and consumers must use the same
+table definition and be built together. Null fallback covers omitted callbacks
+in that definition, not shorter tables from older binaries.
+
+TensorMap resets bucket heads, every retained task head and allocation cursors without
+reconstructing unused entries. Bucket and entry-pool storage is reused while
+its own size matches; task-head and fan-in storage grow only. Changing the
+active task capacity does not reconstruct the unchanged entry pool. A failed
+TensorMap resize preserves the prior layout and contents; a successful init
+empties the map. With default capacities the arrays retain approximately
+8.72 MiB per used slot until finalization. Pool-size changes can temporarily
+hold old and replacement arrays. No new lock or device allocation is involved.
+
+Ready-queue populations are accumulated when a task slot receives its final
+classification. Ordinary tasks, hidden allocation tasks and outer Graph tasks
+participate; Graph definition populations are still combined at bind. Output
+layout entries are initialized and read only at `OUTPUT` argument positions.
 
 `publish_run_image_impl` is the single metadata consumer. Definition and compact
 image sources are retained by the exclusive pipeline slot; A5 scheduler source
@@ -183,12 +210,12 @@ a boundary from which region happens to be reserved first —
 orchestrator, so nothing on the device reads its state: not the `fanin_seen_epoch`
 table, not the scope arrays, not the TensorMap (~9.3 MB between them). It is
 therefore a plain host object that owns those arrays — `OrchestratorState::init`
-allocates them — and `RuntimeContext` reaches it through a pointer that `bind` drops
-before the copied zone is uploaded, so no host address crosses the boundary. A
-`static_assert` keeps `RuntimeContext` trivially copyable, which is what forbids
-putting an owning member back inside it. The one orchestrator value the device-side
-scheduler reads, the count of tasks completed inline during orchestration, is a
-scalar `rt_orchestration_done` publishes into the runtime header.
+allocates them — and the host-side `OrchContext` is what reaches it, through a
+pointer `RuntimeContext` does not carry, so no host address can cross the boundary
+in the first place. A `static_assert` keeps `RuntimeContext` trivially copyable,
+which is what forbids putting an owning member back inside it. The one orchestrator
+value the device-side scheduler reads, the count of tasks completed inline during
+orchestration, is a scalar `rt_orchestration_done` publishes into the runtime header.
 
 **Why the scheduler state is device-written.** `SchedulerState` holds no
 per-run content: `sm_header` and the task-header pointer derive from a pooled SM base,

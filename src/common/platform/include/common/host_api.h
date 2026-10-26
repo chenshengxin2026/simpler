@@ -12,8 +12,18 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <utility>
 
 #include "common/chip_swimlane_extension.h"
+
+// Borrowed source views, valid through stage_launch_metadata; the platform
+// captures values and never takes ownership of the source containers.
+struct HostMetadataRegion {
+    void *device_target;
+    const void *host_source;
+    size_t bytes;
+};
 
 /**
  * Host API function pointers for device memory operations.
@@ -251,6 +261,24 @@ struct HostApiOps {
     // input has no declared producer and stays readable. Zero for a runner with no such
     // allocation, no other declaring run, or no table at all.
     int (*caller_device_span_written_by_other_run)(void *runner_ctx, uint64_t run_id, uint64_t addr, uint64_t bytes);
+    // Appending entries preserves existing offsets. All providers and consumers
+    // must be built with the same table definition; null fallback applies only
+    // to optional callbacks zero-initialized within that definition. An older,
+    // shorter binary table cannot safely expose these fields.
+    // Host-only runtime scratch, isolated by pipeline slot and released with
+    // the slot's retained mirrors. No pointer in this object travels to device.
+    std::shared_ptr<void> (*get_orchestration_scratch)(void *runner_ctx, uint32_t pipeline_slot);
+    void (*set_orchestration_scratch)(void *runner_ctx, uint32_t pipeline_slot, std::shared_ptr<void> scratch);
+    // An unpublished host plan survives native prepare attempts on the same slot.
+    // Optional: only automatic onboard admission can park a managed commit.
+    std::shared_ptr<void> (*get_prepare_plan)(void *runner_ctx, uint32_t pipeline_slot);
+    void (*set_prepare_plan)(void *runner_ctx, uint32_t pipeline_slot, uint64_t run_epoch, std::shared_ptr<void> plan);
+    // Replaces this slot's pending launch metadata with owned byte snapshots.
+    // An empty batch clears a previous unpublished batch. No device work is
+    // submitted here; the onboard launch owns publication and source lifetime.
+    int (*stage_launch_metadata)(
+        void *runner_ctx, uint32_t pipeline_slot, const HostMetadataRegion *regions, size_t count
+    );
 };
 
 /**
@@ -261,6 +289,18 @@ struct HostApiOps {
  */
 struct HostApi {
 public:
+    int stage_launch_metadata(const HostMetadataRegion *regions, size_t count) const {
+        if (ops_->stage_launch_metadata != nullptr)
+            return ops_->stage_launch_metadata(runner_ctx_, pipeline_slot_, regions, count);
+        // CPU transports publish during prepare and have no asynchronous reader.
+        for (size_t i = 0; i < count; ++i) {
+            const auto &region = regions[i];
+            const int rc = copy_to_device(region.device_target, region.host_source, region.bytes);
+            if (rc != 0) return rc;
+        }
+        return 0;
+    }
+
     HostApi(
         void *runner_ctx, uint32_t pipeline_slot, uint32_t arena_bank, uint64_t run_epoch, const HostApiOps *ops
     ) noexcept :
@@ -332,6 +372,23 @@ public:
         return ops_->acquire_scheduler_state_storage(
             runner_ctx_, pipeline_slot_, bytes, alignment, device_out, host_out
         );
+    }
+    std::shared_ptr<void> get_orchestration_scratch() const {
+        return ops_->get_orchestration_scratch == nullptr ?
+                   std::shared_ptr<void>{} :
+                   ops_->get_orchestration_scratch(runner_ctx_, pipeline_slot_);
+    }
+    void set_orchestration_scratch(std::shared_ptr<void> scratch) const {
+        if (ops_->set_orchestration_scratch != nullptr)
+            ops_->set_orchestration_scratch(runner_ctx_, pipeline_slot_, std::move(scratch));
+    }
+    std::shared_ptr<void> get_prepare_plan() const {
+        return ops_->get_prepare_plan == nullptr ? std::shared_ptr<void>{} :
+                                                   ops_->get_prepare_plan(runner_ctx_, pipeline_slot_);
+    }
+    void set_prepare_plan(std::shared_ptr<void> plan) const {
+        if (ops_->set_prepare_plan != nullptr)
+            ops_->set_prepare_plan(runner_ctx_, pipeline_slot_, run_epoch_, std::move(plan));
     }
     int acquire_sm_mirror(size_t bytes, size_t alignment, void **addr_out) const {
         if (ops_->acquire_sm_mirror == nullptr) {

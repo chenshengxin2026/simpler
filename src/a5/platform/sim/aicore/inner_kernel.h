@@ -22,6 +22,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include "aicore_teardown.h"
 #include <dlfcn.h>
 
 #include "aicpu/device_time.h"
@@ -113,6 +114,13 @@ typedef int mem_dsb_t;
 // Equivalent to dmb ish (aarch64) / mfence (x86).
 #define OUT_OF_ORDER_FULL_BARRIER() __sync_synchronize()
 
+// AICPU owns the release line; AICore only observes it.
+inline void wait_for_post_close_release(uint32_t *release) {
+    while (__atomic_load_n(release, __ATOMIC_ACQUIRE) != AICORE_POST_CLOSE_RELEASE) {
+        SPIN_WAIT_HINT();
+    }
+}
+
 // =============================================================================
 // MMIO Load/Store Intrinsics (sim stubs)
 // =============================================================================
@@ -177,6 +185,14 @@ inline uint64_t read_reg(RegId reg) {
     return static_cast<uint64_t>(__atomic_load_n(ptr, __ATOMIC_ACQUIRE));
 }
 
+// Resident startup can fail before AICPU has reset this run's return gate.
+// Only its DMB EXIT, published after that reset, permits the EXITED ACK.
+inline void wait_for_aicpu_exit_signal() {
+    while (static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) != AICORE_EXIT_SIGNAL) {
+        SPIN_WAIT_HINT();
+    }
+}
+
 /**
  * Read the high 32 bits of DATA_MAIN_BASE (early-dispatch doorbell).
  * The high word lives one 32-bit slot above the dispatch token.
@@ -214,5 +230,21 @@ inline void write_reg(RegId reg, uint64_t value) {
  * @return Physical core ID for the current simulated core
  */
 inline uint32_t get_physical_core_id() { return sim_get_physical_core_id(); }
+
+// The caller has observed this run's EXIT after the gate reset. The
+// unique retirement owner publishes one request, possibly after that EXIT.
+// Echo it after quiescence; no subsequent instruction writes an SPR.
+inline void acknowledge_aicore_cond_nonce_and_wait(AicoreTeardownControl *control) {
+    OUT_OF_ORDER_STORE_BARRIER();
+    while (true) {
+        const uint32_t request = __atomic_load_n(&control->exit_request, __ATOMIC_ACQUIRE);
+        if (request == AICORE_EXIT_NONCE_0 || request == AICORE_EXIT_NONCE_1) {
+            write_reg(RegId::COND, request);
+            break;
+        }
+        SPIN_WAIT_HINT();
+    }
+    wait_for_post_close_release(&control->post_close_release);
+}
 
 #endif  // PLATFORM_A5SIM_AICORE_INNER_KERNEL_H_

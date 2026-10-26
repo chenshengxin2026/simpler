@@ -195,3 +195,116 @@ fails; secondary errors remain in its exception context.
 This reference qualification covers serial correctness on A3 HBG. It does not
 establish full vLLM serving, dynamic request admission, A5/TMR coverage,
 capture/replay, implicit host/device synchronization or a performance improvement.
+
+## Independent requests
+
+`clone_worker_submit.py` runs two logically independent requests with the same
+Qwen fixture on one A3 HBG Worker at `launch_depth=2`. Immutable weights and RoPE
+are shared; each live request owns its own KV, block table, metadata, sampled
+token, logits, hidden output and run handle. Decode metadata is host staged at
+bind time so a successor can prepare without a direct-control copy behind the
+predecessor. Within either request, the next decode step uses that request's
+actual sampled output after completion.
+
+```bash
+python clone_worker_submit.py \
+  --fixture /path/to/reference-kv \
+  --kv-reference /path/to/reference-decode-kv \
+  --artifact /path/to/verified-hbg-artifact \
+  --model /path/to/Qwen3-14B \
+  --device DEVICE_ID --steps 127 --output /path/to/new-result-directory
+```
+
+The runner checks free device memory before allocating the second request and
+records a capacity failure when both requests cannot remain resident. A pass
+requires exact sampled tokens, logits/KV numerical gates, request-private
+storage isolation, and an attributable joined-launch trace for every decode pair
+showing the second enqueue before the first operator ends while device execution
+remains serial.
+
+## DEVICE feedback chain
+
+`device_feedback_worker_submit.py` qualifies continuous autoregressive feedback
+on one A3 HBG chip child with at most two pending runs. After completing the
+oldest handle, it refills the queue before waiting for its successor. Two frames
+hold metadata, hidden scratch and HOST logits. The bridge seeds the HOST logits
+as INOUT so HBG uploads a NaN sentinel and publishes the run's logits at its own
+completion. Each frame is read and validated before reuse.
+
+Sampled tokens use DEVICE buffers, initialized to a sentinel before submission.
+Each successor binds the actual preceding DEVICE output. The fixed-count audit
+retains these small token buffers until all consumers complete and host late
+readback validates every token. Device output capacity is checked before
+allocation; weights and KV remain resident. The submission loop performs no
+direct-control device copies.
+
+```bash
+python device_feedback_worker_submit.py \
+  --fixture /path/to/reference-kv \
+  --kv-reference /path/to/reference-decode-kv \
+  --artifact /path/to/verified-hbg-artifact \
+  --model /path/to/Qwen3-14B \
+  --device DEVICE_ID --steps 127 --output /path/to/new-result-directory
+```
+
+Native traces must identify every launch, match joined epochs and prove serial
+device boundaries for every adjacent pair. Qualification requires real joined
+launches, including a refill beyond the initial two submissions. Observed serial
+launches remain in `fallback_edges`; missing evidence and an all-fallback chain
+fail. Tokens, logits and appended KV must pass their gates.
+
+The report separates accepted submissions, prepare-only staged dispatches,
+native enqueues and successful handle completions. Retirement is recorded only
+after successful Worker close, with that basis stated explicitly. Failed reports
+retain accepted run IDs and distinguish incomplete trace observations from zero
+enqueues. Failed close leaves host buffers retained. The qualified scope is
+fixed-count A3 HBG decode with known layouts, one endpoint and diagnostics off.
+
+## Sustained request qualification
+
+`continuous_worker_submit.py` combines request-private storage with DEVICE
+feedback on one A3 HBG endpoint, with diagnostics disabled. The default sequence
+has six requests of 63, 127, 95, 127, 97 and 127 decode steps, two reusable
+request slots, eight run-resource sets and launch depth four. At most four
+handles are pending, with at most two for either request. Each request uses its
+own previous DEVICE sampled token; golden tokens are validation data.
+
+```bash
+python continuous_worker_submit.py \
+  --fixture /path/to/reference-kv \
+  --kv-reference /path/to/reference-decode-kv \
+  --artifact /path/to/verified-hbg-artifact \
+  --model /path/to/Qwen3-14B --device DEVICE_ID \
+  --output /path/to/new-result-directory
+```
+
+Run through `task-submit` on shared hardware after CANN setup and the A3
+architecture precheck. `--pipeline-depth 4 --launch-depth 2` exercises four
+pending runs with a smaller execution window. `--request-steps 5 11 7 13` is a
+short correctness control. `--inject-partial-at 3` raises after the fourth
+orchestration submission; this negative control must exit with an error, stop
+refill, drain returned handles and report the close outcome.
+
+Live requests have disjoint KV, metadata, staging, output and sampled-token
+storage. HOST logits are checked before their frame is reused. Sampled tokens
+remain resident through their DEVICE consumer and delayed HOST audit; attempted
+early release is required to fail while the consumer remains registered.
+
+Request replacement is an explicit drained checkpoint: complete outstanding
+runs, audit tokens and the finished request's KV, restore its slot's initial KV,
+then resume the surviving request before submitting the replacement. Arrival
+qualification requires the replacement's first run to join an executing
+predecessor. Checkpoint gaps are reported as serial edges. This bounded arrival
+schedule does not qualify arbitrary arrivals or concurrent device operators.
+
+The report separates attempts, accepted/staged/native-enqueued/completed/run-
+retired counts and request-slot retirement. It requires attributable native
+identities, serial device boundaries, joined arrival edges, request-local
+DEVICE feedback and joined refill. Serial fallback is counted; missing trace
+evidence fails qualification. Host buffers stay retained if Worker close fails.
+Transport-frame exhaustion/recovery and lease admission use the existing
+scheduler and pending-queue regression tests, alongside this workload test.
+
+The qualified scope is fixed-shape Qwen3-14B on one A3 HBG endpoint with
+diagnostics disabled, independent mutable request storage and a bounded
+sequence. Grant counts and device-memory capacity remain separate constraints.

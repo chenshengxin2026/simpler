@@ -199,7 +199,7 @@ public:
      */
     int init(
         int num_threads, const DepGenAllocCallback &alloc_cb, DepGenRegisterCallback register_cb,
-        const DepGenFreeCallback &free_cb, int device_id
+        const DepGenFreeCallback &free_cb, int device_id, DepGenUnregisterCallback unregister_cb = nullptr
     );
 
     /**

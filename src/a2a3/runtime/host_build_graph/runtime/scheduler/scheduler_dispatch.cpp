@@ -25,7 +25,7 @@
 #include "common/chip_swimlane_profiling.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
-#include "host_build_graph/async_poll_phase_accumulator.h"
+#include "host_build_graph/device/async_poll_phase_accumulator.h"
 #include "host_build_graph/runtime_status.h"
 #include "host_build_graph/runtime_core.h"
 #include "runtime.h"
@@ -1445,7 +1445,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         // Bounded definition materialization. It consumes no AICore, and it is
         // not a release path: a shell's roots are rung on the completion path
-        // (push_ready_routed -> activate_graph_task), and a root published after
+        // (push_ready_routed -> signal_graph_external_ready), and a root published after
         // the shell's one-shot staging claim is never pre-staged, so nothing
         // reachable from here can free a core another task waits on. That is
         // what lets it sit behind the Phase 2 drain check — a drain holding it
@@ -1483,7 +1483,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                     fail_scheduler(runtime, thread_idx, SIMPLER_ERROR_INVALID_ARGS);
                     break;
                 }
-                if (tasks_materialized > 0 || result == GraphMaterializeResult::PREPARED) {
+                if (tasks_materialized > 0 || result == GraphMaterializeResult::MATERIALIZED) {
                     made_progress = true;
                 }
 #if SIMPLER_DFX

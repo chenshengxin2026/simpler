@@ -19,15 +19,10 @@
 #include "call_config.h"
 #include "common/host_api.h"
 #include "native_run_execution.h"
+#include "native_run_phase.h"
+#include "native_run_storage_tag.h"
 #include "runtime_c_api.h"
 #include "runtime.h"
-
-/** Internal phase of the caller-owned opaque native-run storage. */
-enum class NativeRunPhase : uint8_t {
-    Prepared,
-    Running,
-    Complete,
-};
 
 /**
  * The single placement-owned carrier for one progressable native lifecycle.
@@ -37,7 +32,7 @@ enum class NativeRunPhase : uint8_t {
  */
 template <typename Runner>
 struct NativeRunContext {
-    static constexpr uint64_t kMagic = UINT64_C(0x534d504c52554e31);  // "SMPLRUN1"
+    static constexpr uint64_t kMagic = kNativeRunContextMagic;
 
     NativeRunContext(
         Runner *runner_in, const CallConfig &config_in, uint64_t trace_hid_in, const NativeRunDescriptor &descriptor_in,
@@ -87,6 +82,10 @@ struct NativeRunContext {
     std::unique_ptr<typename Runner::ActiveExecution> active_execution{};
     LaunchPermit launch_permit{};
     char trace_attrs[192]{};
+    // True only for a launch entry that has not attempted execution-visible
+    // submission, or whose returned transaction explicitly reports NotStarted.
+    // Backend exceptions return Partial with an active owner, never this proof.
+    bool launch_not_started_proven{false};
     bool runner_resources_owned{false};
     bool runner_reserved{false};
     bool runner_claimed{false};
@@ -96,11 +95,38 @@ struct NativeRunContext {
             descriptor.run_epoch, descriptor.generation, descriptor.dispatch_id, descriptor.pipeline_slot
         };
     }
+
+    /**
+     * This run's whole published identity, by value.
+     *
+     * Separate from `identity()` because that one carries what later phase
+     * calls address the run by, and has no field for `run_id` — which a reader
+     * joining an artifact to the submission that produced it needs. The
+     * acceptance sink and its value are deliberately absent: they are the
+     * caller's pointer and sentinel, and belong to `publish_acceptance` alone.
+     */
+    NativeRunArtifactIdentity artifact_identity() const {
+        NativeRunArtifactIdentity snapshot{};
+        snapshot.run_id = descriptor.run_id;
+        snapshot.dispatch_id = descriptor.dispatch_id;
+        snapshot.generation = descriptor.generation;
+        std::memcpy(
+            snapshot.owner_instance_id, descriptor.provenance.owner_instance_id, sizeof(snapshot.owner_instance_id)
+        );
+        snapshot.pipeline_slot = descriptor.pipeline_slot;
+        snapshot.chip_rank = descriptor.provenance.chip_rank;
+        snapshot.capture_index = descriptor.provenance.capture_index;
+        snapshot.task_slot = descriptor.provenance.task_slot;
+        snapshot.group_index = descriptor.provenance.group_index;
+        snapshot.group_size = descriptor.provenance.group_size;
+        return snapshot;
+    }
 };
 
 /** End object lifetime, then mark the caller-owned storage reusable. */
 template <typename Runner>
 void destroy_native_run_context(NativeRunContext<Runner> *context) {
+    static_assert(sizeof(NativeRunContext<Runner>) >= kNativeRunPrepareReleaseBytes);
     void *storage = context;
     context->~NativeRunContext<Runner>();
     constexpr uint64_t kEmpty = 0;

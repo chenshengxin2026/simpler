@@ -36,8 +36,10 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -80,9 +82,17 @@ extern "C" int bind_callable_to_runtime_impl(
 
 namespace {
 
-// A concrete runner: the pure virtuals below are the execution surface, which
-// no case here drives. The accessors read the production pool the registration
-// publishes into.
+// The collector owns host storage for its terminal banks; this is the allocator pair the runner
+// would otherwise be handed by the platform.
+void *sim_bank_alloc(size_t size) { return std::calloc(1, size); }
+
+int sim_bank_free(void *ptr) {
+    std::free(ptr);
+    return 0;
+}
+
+// A concrete runner for registration and execution-owner contracts. The
+// accessors read the production pool published by registration.
 class PoolRunner : public SimDeviceRunnerBase {
 public:
     int prepare_execution(
@@ -91,8 +101,14 @@ public:
     ) override {
         return -1;
     }
-    LaunchOutcome launch_execution(std::unique_ptr<PreparedExecution> /*prepared*/, LaunchPermit /*permit*/) override {
-        return LaunchOutcome{};
+    bool throw_on_launch{false};
+    bool partial_on_launch{false};
+    int launch_calls{0};
+    LaunchTransactionResult launch_execution_impl(PreparedExecution & /*prepared*/, LaunchPermit /*permit*/) override {
+        ++launch_calls;
+        if (throw_on_launch) throw std::bad_alloc();
+        if (partial_on_launch) return LaunchTransactionResult{-4321, LaunchProgress::Partial, LaunchReceipt{}};
+        return LaunchTransactionResult{};
     }
     void abandon_prepared_execution(PreparedExecution & /*prepared*/) noexcept override {}
     int poll_execution(const ActiveExecution & /*active*/) override { return 0; }
@@ -104,6 +120,13 @@ public:
     // The bulk-free finalize() performs, so each case leaves no scratch or
     // handle behind.
     void release_all() { release_callable_state(); }
+    void release_retained_orchestration() { release_sm_mirrors(); }
+
+    // The diagnostic bank surface, which is a runner method rather than a pool one: the sim
+    // runner has its own copy of it and its own collector instance, so this is where a parity
+    // claim about banks can be made against sim code rather than against shared code.
+    uint64_t arm_terminal_bank(uint64_t run_epoch) { return arm_chip_swimlane_run_terminal_bank(run_epoch); }
+    ChipSwimlaneCollector &swimlane() { return chip_swimlane_collector_; }
 
     size_t pool_size() const { return chip_callable_buffers_.size(); }
 
@@ -170,7 +193,7 @@ make_chip(const std::vector<int32_t> &func_ids, const std::vector<uint8_t> &bina
     for (size_t i = 0; i < func_ids.size(); ++i)
         children.push_back(make_child(binary));
     const uint8_t orch[64] = {orch_tag};
-    return make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>(
+    return make_chip_callable(
         nullptr, 0, "orch_entry", orch, sizeof(orch), func_ids.data(), children.data(),
         static_cast<int32_t>(func_ids.size()), "orch_config"
     );
@@ -224,6 +247,50 @@ protected:
 // pool entry, and therefore no chip_dev any caller could reach. The successful
 // registration that follows proves the refused one left the pool usable rather
 // than merely empty.
+TEST_F(SimCallablePoolTest, AThrowingLaunchStillOwnsItsPreparedState) {
+    PoolRunner runner;
+    Runtime runtime;
+    auto prepared =
+        std::make_unique<PoolRunner::PreparedExecution>(NativeRunIdentity{10, 10, 10, 0}, runtime, CallConfig{}, 0);
+    auto *original = prepared.get();
+    runner.throw_on_launch = true;
+    auto outcome = runner.launch_execution(std::move(prepared), LaunchPermit{});
+    EXPECT_EQ(outcome.rc, PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(outcome.progress, LaunchProgress::Partial);
+    ASSERT_NE(outcome.active, nullptr);
+    EXPECT_EQ(outcome.active->prepared.get(), original);
+    EXPECT_EQ(outcome.active->progress, LaunchProgress::Partial);
+    EXPECT_FALSE(outcome.receipt.valid());
+    EXPECT_EQ(outcome.prepared, nullptr);
+    EXPECT_EQ(runner.launch_calls, 1);
+    EXPECT_FALSE(runner.can_accept_run());
+}
+
+TEST_F(SimCallablePoolTest, APartialLaunchStopsFurtherAdmission) {
+    PoolRunner runner;
+    Runtime runtime;
+    auto prepared =
+        std::make_unique<PoolRunner::PreparedExecution>(NativeRunIdentity{10, 10, 10, 0}, runtime, CallConfig{}, 0);
+    auto *original = prepared.get();
+    runner.partial_on_launch = true;
+    auto outcome = runner.launch_execution(std::move(prepared), LaunchPermit{});
+    EXPECT_EQ(outcome.rc, -4321);
+    EXPECT_EQ(outcome.progress, LaunchProgress::Partial);
+    ASSERT_NE(outcome.active, nullptr);
+    EXPECT_EQ(outcome.active->prepared.get(), original);
+    EXPECT_FALSE(runner.can_accept_run());
+}
+
+TEST_F(SimCallablePoolTest, AnEmptyLaunchNeverEntersTheBackend) {
+    PoolRunner runner;
+    auto outcome = runner.launch_execution(nullptr, LaunchPermit{});
+    EXPECT_NE(outcome.rc, 0);
+    EXPECT_EQ(outcome.progress, LaunchProgress::NotStarted);
+    EXPECT_EQ(outcome.prepared, nullptr);
+    EXPECT_EQ(outcome.active, nullptr);
+    EXPECT_EQ(runner.launch_calls, 0);
+}
+
 TEST_F(SimCallablePoolTest, AFailedRegistrationPublishesNothing) {
     const std::vector<uint8_t> unloadable = make_chip({0}, std::vector<uint8_t>(256, 0x7f), 0x11);
 
@@ -239,7 +306,7 @@ TEST_F(SimCallablePoolTest, AFailedRegistrationPublishesNothing) {
 // A func_id the runtime's tables cannot address is refused before anything is
 // allocated, so it too publishes nothing.
 TEST_F(SimCallablePoolTest, AnUnaddressableFuncIdPublishesNothing) {
-    const std::vector<uint8_t> chip = make_chip({RUNTIME_MAX_FUNC_ID}, kernel_, 0x33);
+    const std::vector<uint8_t> chip = make_chip({CHIP_MAX_FUNC_ID}, kernel_, 0x33);
     EXPECT_EQ(runner_.upload_chip_callable_buffer(as_chip(chip)), 0u);
     EXPECT_EQ(runner_.pool_size(), 0u);
 }
@@ -432,6 +499,110 @@ TEST_F(SimCallablePoolTest, ReRegisteringRebuildsTheTables) {
     EXPECT_EQ(second.object_table_dev, reinterpret_cast<uint64_t>(second.object_table));
     EXPECT_NE(second.object_table[0], 0u);
     EXPECT_NE(second.entry_table[0], 0u);
+}
+
+// Contract rows 37 and 39, where they meet: `arm_chip_swimlane_run_terminal_bank` is the
+// production function that turns "no bank is free" into the zero the device reads, and the sim
+// runner has its own copy of it and its own collector. This drives that function, not the
+// collector beneath it.
+//
+// Both of its zero-returning branches are covered: a collector with no shared region, where the
+// acquire succeeds and the *arm* refuses — the branch that must give the credit back, since
+// keeping it would retire one of the fixed banks per failed arm — and a full bank table, where
+// the acquire itself refuses.
+//
+// On what this says about parity more widely: the lane and the operation lease are shared code
+// a sim build links unchanged, but the C entry points beneath them are not — sim has its own
+// `prepare` / `launch` / `poll` / `wait` / `finalize`. So this is a parity claim about the bank
+// surface specifically, and the lifecycle rows are not transferred to sim by it.
+TEST_F(SimCallablePoolTest, TheSimRunnerHandsDiagnosticBanksOutByEpochAndRefusesBeyondTheBankCount) {
+    // No region yet, so the acquire inside the runner succeeds and the arm refuses. Zero reaches
+    // the device, and the bank it briefly took is not lost.
+    EXPECT_EQ(runner_.arm_terminal_bank(6001), 0u) << "the sim runner armed a bank with no shared region to arm it in";
+
+    ASSERT_EQ(
+        runner_.swimlane().initialize(
+            /*num_aicore=*/1, /*aicpu_thread_num=*/1, /*device_id=*/0, ChipSwimlaneLevel::SCHEDULE_TIMING,
+            sim_bank_alloc, nullptr, sim_bank_free
+        ),
+        0
+    );
+
+    std::vector<uint64_t> armed;
+    for (int index = 0; index < PLATFORM_RUN_TERMINAL_BANKS; index++) {
+        const uint64_t address = runner_.arm_terminal_bank(7000 + static_cast<uint64_t>(index));
+        EXPECT_NE(address, 0u) << "epoch " << (7000 + index)
+                               << " found no bank while the table was not yet full; a refused arm kept its credit";
+        armed.push_back(address);
+    }
+    EXPECT_EQ(std::set<uint64_t>(armed.begin(), armed.end()).size(), armed.size())
+        << "two live runs were armed into one bank";
+
+    // Beyond the count: zero, which is what the device reads as "publish no snapshot".
+    EXPECT_EQ(runner_.arm_terminal_bank(7999), 0u) << "the sim runner invented an address for a run with no bank";
+    // A holder re-arming gets its own storage back rather than a second bank.
+    EXPECT_EQ(runner_.arm_terminal_bank(7000), armed[0]);
+
+    // And the same release-then-serve order the onboard runner has.
+    runner_.swimlane().release_run_terminal_bank(7001);
+    EXPECT_EQ(runner_.arm_terminal_bank(7999), armed[1]) << "the released bank was not the one handed on";
+
+    runner_.swimlane().finalize(nullptr, sim_bank_free);
+}
+
+// Exercise the real runner storage and teardown helper; no device execution
+// is needed to observe host ownership. Finalization must drop every slot once.
+TEST(SimOrchestrationScratchTest, TeardownReleasesAllSlotsAndIsIdempotent) {
+    PoolRunner runner;
+    PoolRunner other;
+    constexpr uint32_t granted = 7;
+    ASSERT_TRUE(runner.set_run_resource_grant(granted));
+    ASSERT_TRUE(other.set_run_resource_grant(granted));
+    auto outside_grant = std::make_shared<int>(0);
+    std::weak_ptr<int> unretained = outside_grant;
+    runner.set_orchestration_scratch(granted, outside_grant);
+    outside_grant.reset();
+    EXPECT_TRUE(unretained.expired());
+    EXPECT_EQ(runner.get_orchestration_scratch(granted), nullptr);
+    int destroyed = 0;
+    std::vector<std::weak_ptr<void>> weak(granted);
+    for (uint32_t slot = 0; slot < granted; ++slot) {
+        std::shared_ptr<void> value(new int(slot), [&destroyed](void *p) {
+            ++destroyed;
+            delete static_cast<int *>(p);
+        });
+        weak[slot] = value;
+        runner.set_orchestration_scratch(slot, value);
+        EXPECT_EQ(other.get_orchestration_scratch(slot), nullptr);
+    }
+    EXPECT_EQ(destroyed, 0);
+    // A bind's local reference remains valid until that borrower leaves.
+    auto borrower = runner.get_orchestration_scratch(0);
+    runner.release_retained_orchestration();
+    EXPECT_EQ(destroyed, granted - 1);
+    EXPECT_FALSE(weak[0].expired());
+    for (uint32_t slot = 0; slot < granted; ++slot) {
+        EXPECT_EQ(runner.get_orchestration_scratch(slot), nullptr);
+        if (slot != 0) EXPECT_TRUE(weak[slot].expired());
+    }
+    borrower.reset();
+    EXPECT_TRUE(weak[0].expired());
+    EXPECT_EQ(destroyed, granted);
+    runner.release_retained_orchestration();
+    EXPECT_EQ(destroyed, granted);
+}
+
+TEST(SimOrchestrationScratchTest, RunnerDestructionReleasesRetainedStorage) {
+    std::weak_ptr<void> weak;
+    {
+        PoolRunner runner;
+        auto value = std::make_shared<int>(7);
+        weak = value;
+        runner.set_orchestration_scratch(0, value);
+        value.reset();
+        EXPECT_FALSE(weak.expired());
+    }
+    EXPECT_TRUE(weak.expired());
 }
 
 }  // namespace

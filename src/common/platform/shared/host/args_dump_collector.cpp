@@ -167,8 +167,13 @@ void ArgsDumpCollector::merge_collector_shards() {
 
 int ArgsDumpCollector::initialize(
     int num_dump_threads, int device_id, DumpArgsLevel dump_args_level, const DumpAllocCallback &alloc_cb,
-    DumpRegisterCallback register_cb, const DumpFreeCallback &free_cb
-) {
+    DumpRegisterCallback register_cb, const DumpFreeCallback &free_cb, DumpUnregisterCallback unregister_cb
+) try {
+    if (register_cb != nullptr && unregister_cb == nullptr) {
+        LOG_ERROR("Dump collector registration requires an unregister callback");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+
     if (shm_host_ != nullptr) {
         // Already holding this run's device resources. They are not per-run:
         // configuration arrives via begin_run() and the layout is fixed at
@@ -204,14 +209,16 @@ int ArgsDumpCollector::initialize(
     // start(tf) a no-op without further bookkeeping.
     set_memory_context(
         alloc_cb, register_cb, free_cb, profiling_copy_to_device_or_null(), profiling_copy_from_device_or_null(),
-        /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id
+        /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id, unregister_cb
     );
 
     // RAII rollback: any early return after this point releases the shm
     // region + per-thread arenas + DumpMetaBuffers through the framework's
     // dev→host map. `guard.commit()` runs on the success path before the
     // trailing return 0.
-    profiling_common::InitRollbackGuard<decltype(manager_)> guard(manager_, free_cb);
+    profiling_common::InitRollbackGuard<decltype(manager_)> guard(
+        manager_, free_cb, register_cb != nullptr ? unregister_cb : nullptr, device_id
+    );
 
     // Allocate dump shared memory (header + buffer states)
     size_t shm_size = calc_dump_data_size(num_dump_threads);
@@ -286,24 +293,20 @@ int ArgsDumpCollector::initialize(
 
     // Push the entire initialized shm region (header + BufferStates +
     // free_queue contents) to device.
-    profiling_copy_to_device(shm_dev_local, shm_host_local, shm_size);
+    if (int rc = profiling_copy_to_device(shm_dev_local, shm_host_local, shm_size); rc != 0) return rc;
 
-    // Publish shm pointers on the base now that the region is ready. start(tf)
-    // gates on shm_host_ being non-null, so this re-set_memory_context call
-    // is the moment the collector becomes startable.
+    guard.commit();
     dump_shared_mem_dev_ = shm_dev_local;
-    set_memory_context(
-        alloc_cb, register_cb, free_cb, profiling_copy_to_device_or_null(), profiling_copy_from_device_or_null(),
-        shm_dev_local, shm_host_local, shm_size, device_id
-    );
+    publish_shared_memory(shm_dev_local, shm_host_local, shm_size);
 
     LOG_INFO(
         "Args dump initialized: %d threads, arena=%lu MB/thread, %d buffers/thread", num_dump_threads,
         arena_size / (1024 * 1024), PLATFORM_DUMP_BUFFERS_PER_THREAD
     );
 
-    guard.commit();
     return 0;
+} catch (const std::bad_alloc &) {
+    return PTO_RUNTIME_ERR_INTERNAL;
 }
 
 void ArgsDumpCollector::start(const profiling_common::ThreadFactory &thread_factory) {
@@ -1052,6 +1055,8 @@ int ArgsDumpCollector::finalize(DumpUnregisterCallback unregister_cb, const Dump
     if (bin_file_.is_open()) {
         bin_file_.close();
     }
+
+    if (!validate_release_callbacks(unregister_cb, free_cb)) return PTO_RUNTIME_ERR_INTERNAL;
 
     auto release_dev = [&](void *p) {
         release_one_buffer(p, unregister_cb, free_cb);

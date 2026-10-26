@@ -259,8 +259,29 @@ def _class_pipeline_depth(cls, cases) -> int:
     return requested.pop() if requested else 0
 
 
+def _scene_admission_kwargs(cls, cases) -> dict:
+    """Preserve explicit scene controls, or omit every control for a default-mode scene."""
+    controls = {"pipeline_depth", "launch_depth", "pending_run_depth", "workspace_budget_bytes"}
+    if getattr(cls, "_st_automatic_admission", False):
+        if cls._st_level != 3:
+            raise ValueError("automatic_admission scene metadata requires level 3")
+        for case in cases:
+            contradictory = controls.intersection(case.get("config", {}))
+            if contradictory:
+                raise ValueError(f"{cls.__name__} automatic_admission contradicts {sorted(contradictory)}")
+        return {}
+    depths = {int(c.get("config", {}).get("launch_depth", 1)) for c in cases}
+    if len(depths) > 1:
+        raise SystemExit(
+            f"{cls.__name__} mixes launch_depth values {sorted(depths)} across its cases; "
+            "launch_depth applies to the whole Worker, so split them into one class per depth"
+        )
+    capacity = _class_pipeline_depth(cls, cases)
+    return {"launch_depth": depths.pop() if depths else 1, **({"pipeline_depth": capacity} if capacity else {})}
+
+
 def _standalone_worker_groups(selected_by_cls):
-    """The classes that may share one Worker, keyed by `(runtime, level, capacity, retention)`.
+    """The classes that may share one Worker, keyed by runtime, level, capacity, retention and cold-start owner.
 
     Capacity is part of the key rather than something reconciled after grouping: a Worker's
     `pipeline_depth` is granted once, before its first run, so classes that ask for different
@@ -272,13 +293,15 @@ def _standalone_worker_groups(selected_by_cls):
     artifact is not written until `flush_diagnostics()`. A class that never asked for it must
     not be moved onto that path by a neighbour that did.
     """
-    groups: dict[tuple[str, int, int, bool], list[type]] = {}
+    # Automatic scenes measure cold startup, so each class owns a fresh Worker.
+    groups: dict[tuple[str, int, int, bool, type | None], list[type]] = {}
     for cls, cases in selected_by_cls.items():
         key = (
             cls._st_runtime,
             cls._st_level,
             _class_pipeline_depth(cls, cases),
             bool(getattr(cls, "_st_collect_across_runs", False)),
+            cls if getattr(cls, "_st_automatic_admission", False) else None,
         )
         groups.setdefault(key, []).append(cls)
     return groups
@@ -1362,7 +1385,10 @@ def _convert_rank_swimlanes(
     relative timeline. Losing the common axis should cost the common axis, not
     the whole case's swimlane.
     """
-    from simpler_setup.tools.swimlane_converter import discover_l3_conversion_targets  # noqa: PLC0415
+    from simpler_setup.tools.swimlane_converter import (  # noqa: PLC0415, PLC2701
+        _capture_records_paths,
+        discover_l3_conversion_targets,
+    )
 
     def dump_name_map(capture_dir: Path) -> Path | None:
         if not callable_spec:
@@ -1370,7 +1396,9 @@ def _convert_rank_swimlanes(
         safe_label = _sanitize_for_filename(case_label)
         return _dump_name_map(_extract_name_map(callable_spec), capture_dir / f"name_map_{safe_label}.json")
 
-    captures = [path for path in _rank_capture_dirs(output_prefix) if (path / "chip_swimlane_records.json").is_file()]
+    # Both shapes count: the fixed name the non-retained path writes, and a
+    # retained artifact the capture's own dispatch identity names.
+    captures = [path for path in _rank_capture_dirs(output_prefix) if _capture_records_paths(path)]
     if not captures:
         logger.warning(f"[{case_label}] no Rank capture is present under {output_prefix}")
         return
@@ -1398,9 +1426,12 @@ def _convert_rank_swimlanes(
             output_path=output_prefix / f"{target['output_stem']}.json" if len(targets) > 1 else None,
         )
         if not merged:
-            for capture_dir in target["capture_dirs"]:
+            # The files this target selected, never a fresh scan of its
+            # directories: a scan would offer the other form too, and could
+            # resurrect a capture discovery rejected for a duplicate identity.
+            for capture_dir, records_path in zip(target["capture_dirs"], target["records_paths"], strict=True):
                 _run_swimlane_converter(
-                    input_path=capture_dir / "chip_swimlane_records.json",
+                    input_path=records_path,
                     host_logs=host_logs,
                     func_names_path=dump_name_map(capture_dir),
                     enable_overhead=enable_overhead,
@@ -1424,11 +1455,12 @@ def _convert_case_swimlane(
 
     logger = logging.getLogger(__name__)
     if _rank_dirs(output_prefix):
-        captures = [
-            directory
-            for directory in _rank_capture_dirs(output_prefix)
-            if (directory / "chip_swimlane_records.json").is_file()
-        ]
+        # A capture counts when it holds either shape: the fixed name the
+        # non-retained path writes, or a retained artifact its own dispatch
+        # identity names. The converter applies the same two rules.
+        from simpler_setup.tools.swimlane_converter import _capture_records_paths  # noqa: PLC0415, PLC2701
+
+        captures = [directory for directory in _rank_capture_dirs(output_prefix) if _capture_records_paths(directory)]
         # Runtime-exported timing logs allow capture-local lookup when all are present.
         # Other Rank merges use the bound persistent logs.
         host_logs = (
@@ -1925,10 +1957,19 @@ def _validate_case_configs(cls: type) -> None:
             )
 
 
-def scene_test(level: int | SceneTestLevel, runtime: str, collect_across_runs: bool = False):
+def scene_test(
+    level: int | SceneTestLevel,
+    runtime: str,
+    collect_across_runs: bool = False,
+    automatic_admission: bool = False,
+):
     """Decorator marking a SceneTestCase with level and runtime.
 
     Platforms are declared per-case in CASES, not here.
+
+    ``automatic_admission`` is test-only metadata for an L3 Worker constructed
+    with all admission controls omitted. Explicit controls on such a class
+    are contradictory and rejected; existing scenes keep explicit launch depth.
 
     ``collect_across_runs`` opts the class's Worker into cross-run diagnostic
     retention. It changes when a diagnostic file exists — with it on, ``run()``
@@ -1939,8 +1980,11 @@ def scene_test(level: int | SceneTestLevel, runtime: str, collect_across_runs: b
     level_decorator = scene_level(level)
 
     def decorator(cls):
-        _validate_case_configs(cls)
         level_decorator(cls)
+        cls._st_automatic_admission = automatic_admission
+        if automatic_admission:
+            _scene_admission_kwargs(cls, cls.CASES)
+        _validate_case_configs(cls)
         cls._st_runtime = runtime
         cls._st_collect_across_runs = collect_across_runs
         cls_dir = Path(inspect.getfile(cls)).parent
@@ -2716,7 +2760,7 @@ class SceneTestCase:
         by_rt_level = _standalone_worker_groups(selected_by_cls)
 
         ok = True
-        for (runtime, level, capacity, retention), group in by_rt_level.items():
+        for (runtime, level, capacity, retention, _automatic), group in by_rt_level.items():
             retained = "  Cross-run retention: on" if retention else ""
             print(f"\n=== Runtime: {runtime}  Level: {level}  Pipeline depth: {capacity or 'default'}{retained} ===")
             worker, per_class_sub_handles, per_class_chip_handles = _create_standalone_worker(
@@ -2993,26 +3037,20 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
         (c.get("config", {}).get("num_sub_workers", 0) for cls in group for c in selected_by_cls.get(cls, [])),
         default=0,
     )
-    # `min`, not `max`: this Worker is shared by every class in the group, and a
-    # depth above one changes how their runs reach the device. A class that asked
-    # for one must get one, so a mixed group runs serially and a class that needs
-    # the greater depth fails visibly on its own assertions rather than silently
-    # imposing it on its neighbours.
-    launch_depth = min(
-        (c.get("config", {}).get("launch_depth", 1) for cls in group for c in selected_by_cls.get(cls, [])),
-        default=1,
-    )
-    # Not reconciled here: a Worker's capacity is granted once, before any run, so a group whose
-    # classes disagree has no single answer and the caller must partition instead. Zero means
-    # unset, which takes the standing default request.
-    capacities = {_class_pipeline_depth(cls, selected_by_cls.get(cls, [])) for cls in group}
+    modes = {bool(getattr(cls, "_st_automatic_admission", False)) for cls in group}
+    if len(modes) > 1:
+        raise SystemExit("one Worker cannot serve both automatic and explicit admission scenes")
+    policies = [_scene_admission_kwargs(cls, selected_by_cls.get(cls, [])) for cls in group]
+    capacities = {policy.get("pipeline_depth", 0) for policy in policies}
     if len(capacities) > 1:
-        raise SystemExit(
-            f"one Worker cannot serve pipeline_depth values {sorted(capacities)}: "
-            f"{', '.join(sorted(cls.__name__ for cls in group))} were grouped together, and a granted "
-            f"capacity cannot be changed once a Worker is up"
-        )
-    pipeline_depth = capacities.pop() if capacities else 0
+        raise SystemExit(f"one Worker cannot serve pipeline_depth values {sorted(capacities)}")
+    admission_kwargs = {}
+    if not modes.pop():
+        # Existing explicit classes sharing a Worker retain their conservative minimum.
+        admission_kwargs["launch_depth"] = min(policy["launch_depth"] for policy in policies)
+        capacity = capacities.pop()
+        if capacity:
+            admission_kwargs["pipeline_depth"] = capacity
     # Not reconciled here either, and for a second reason on top of capacity's: retention changes
     # what `run()` returning means, so neither answer is safe to pick for a class that chose the
     # other. The caller partitions on it (see `_standalone_worker_groups`); this refusal is what a
@@ -3039,9 +3077,8 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
         platform=args.platform,
         runtime=first_cls._st_runtime,
         enable_sdma=any(_class_wants_sdma(c) for c in group),
-        launch_depth=launch_depth,
         collect_across_runs=collect_across_runs,
-        **({"pipeline_depth": pipeline_depth} if pipeline_depth else {}),
+        **admission_kwargs,
     )
     # Prepare sub callables per-class to avoid name collisions.
     per_class_sub_handles: dict[type, dict] = {}

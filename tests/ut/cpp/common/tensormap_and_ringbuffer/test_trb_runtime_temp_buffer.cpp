@@ -65,6 +65,8 @@ constexpr size_t kAlign = 1024;
 size_t align_up(size_t value, size_t alignment) { return (value + alignment - 1) & ~(alignment - 1); }
 
 struct FakeHostApi {
+    int staging_status = 0;
+    int arena_status = 0;
     int device_malloc_count = 0;
     int device_free_count = 0;
     int copy_to_count = 0;
@@ -85,6 +87,26 @@ struct FakeHostApi {
     std::vector<uint8_t> compatibility_key;
     uint64_t observed_hash = 0;
     std::vector<uint8_t> observed_key;
+    // A real prebuilt-arena cache, rather than the key-probe stand-in above.
+    //
+    // The default hooks record nothing and answer a hit with placeholder addresses, which is
+    // enough for a case that only asks which key was probed — but it means every bind takes the
+    // miss path and rebuilds. A case about what a *hit* does needs the entry the production
+    // store would have written: the same pointers, offset and image the build published, handed
+    // back unchanged on every later lookup.
+    bool cache_recording = false;
+    bool cache_recorded = false;
+    uint64_t cached_hash = 0;
+    std::vector<uint8_t> cached_key;
+    void *cached_gm_heap = nullptr;
+    void *cached_gm_sm = nullptr;
+    void *cached_runtime_arena = nullptr;
+    size_t cached_runtime_off = 0;
+    const void *cached_image = nullptr;
+    size_t cached_image_size = 0;
+    int cache_store_count = 0;
+    int cache_hit_count = 0;
+    int cache_miss_count = 0;
     // The run-owned terminal snapshot this run published, or empty for a run
     // that published none. Host storage: the platform's real region is device
     // memory the device wrote before its kernel returned, and the host reads it
@@ -176,6 +198,7 @@ int fake_setup_static_arena(
     void * /*runner_ctx*/, uint32_t /*arena_bank*/, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size
 ) {
     ++g_fake->setup_static_arena_count;
+    if (g_fake->arena_status != 0) return g_fake->arena_status;
     g_fake->gm_heap.assign(gm_heap_size, 0);
     g_fake->gm_sm.assign(gm_sm_size, 0);
     g_fake->runtime_arena.assign(runtime_arena_size, 0);
@@ -199,6 +222,24 @@ bool fake_lookup_prebuilt_runtime_arena_cache(
     const auto *key = static_cast<const uint8_t *>(key_data);
     g_fake->observed_hash = hash;
     g_fake->observed_key.assign(key, key + key_size);
+    if (g_fake->cache_recording) {
+        const bool hit = arena_bank == 0 && g_fake->cache_recorded && hash == g_fake->cached_hash &&
+                         g_fake->observed_key == g_fake->cached_key;
+        if (!hit) {
+            g_fake->cache_miss_count++;
+            return false;
+        }
+        // Exactly what the store recorded, which is what makes a hit a reuse rather than a
+        // second arena wearing the same key.
+        g_fake->cache_hit_count++;
+        *gm_heap_base = g_fake->cached_gm_heap;
+        *sm_base = g_fake->cached_gm_sm;
+        *runtime_arena_base = g_fake->cached_runtime_arena;
+        *runtime_off = g_fake->cached_runtime_off;
+        *image_data = g_fake->cached_image;
+        *image_size = g_fake->cached_image_size;
+        return true;
+    }
     const bool hit = arena_bank == 0 && g_fake->compatibility_key_valid && hash == g_fake->compatibility_hash &&
                      g_fake->observed_key == g_fake->compatibility_key;
     if (hit) {
@@ -212,10 +253,23 @@ bool fake_lookup_prebuilt_runtime_arena_cache(
     return hit;
 }
 void fake_mark_prebuilt_runtime_arena_cached(
-    void * /*runner_ctx*/, uint32_t /*arena_bank*/, uint64_t /* hash */, const void * /* key_data */,
-    size_t /* key_size */, void * /* gm_heap_base */, void * /* sm_base */, void * /* runtime_arena_base */,
-    size_t /* runtime_off */, const void * /* image_data */, size_t /* image_size */
-) {}
+    void * /*runner_ctx*/, uint32_t /*arena_bank*/, uint64_t hash, const void *key_data, size_t key_size,
+    void *gm_heap_base, void *sm_base, void *runtime_arena_base, size_t runtime_off, const void *image_data,
+    size_t image_size
+) {
+    if (!g_fake->cache_recording) return;
+    const auto *key = static_cast<const uint8_t *>(key_data);
+    g_fake->cache_store_count++;
+    g_fake->cache_recorded = true;
+    g_fake->cached_hash = hash;
+    g_fake->cached_key.assign(key, key + key_size);
+    g_fake->cached_gm_heap = gm_heap_base;
+    g_fake->cached_gm_sm = sm_base;
+    g_fake->cached_runtime_arena = runtime_arena_base;
+    g_fake->cached_runtime_off = runtime_off;
+    g_fake->cached_image = image_data;
+    g_fake->cached_image_size = image_size;
+}
 uint64_t fake_upload_chip_callable_buffer(void * /*runner_ctx*/, const void * /* callable */) { return 0; }
 
 // The run-owned snapshot, as the platform serves it: a host-readable copy of
@@ -235,6 +289,7 @@ fake_get_run_result(void * /*runner_ctx*/, uint32_t /*pipeline_slot*/, uint64_t 
 int fake_acquire_retained_temp(
     void *runner_ctx, uint32_t pipeline_slot, size_t bytes, void **addr_out, size_t *size_out
 ) {
+    if (g_fake->staging_status != 0) return g_fake->staging_status;
     fake_get_retained_temp_buffer(runner_ctx, pipeline_slot, addr_out, size_out);
     if (bytes == 0 || bytes <= *size_out) return 0;
     if (*addr_out != nullptr) fake_device_free(runner_ctx, *addr_out);
@@ -243,7 +298,7 @@ int fake_acquire_retained_temp(
     if (grown == nullptr) {
         *addr_out = nullptr;
         *size_out = 0;
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     *addr_out = grown;
     *size_out = bytes;
@@ -273,16 +328,6 @@ HostApi make_host_api() {
     };
     return HostApi(nullptr, 0, 0, 0, &ops);
 }
-
-// Whether the runtime under test reads *only* the run-owned record on the
-// failure path. a5 declares joined-launch support, so a successor may already
-// have reset the shared memory header by the time this host call runs and the
-// header is therefore never read; a2a3 launches one run at a time, still owns
-// the header for the whole call, and still falls back to it. Both contracts are
-// asserted exactly below — neither arch's behaviour is relaxed to accommodate
-// the other. `SIMPLER_PLATFORM_NAME` is the per-arch define every runtime case
-// already carries.
-constexpr bool kReadsOnlyTheRunOwnedRecord = SIMPLER_PLATFORM_NAME[1] == '5';
 
 // One run's terminal error tail, in the layout `get_run_result` serves: the
 // bytes of a `SharedMemoryHeader` from its first error field to its end.
@@ -416,18 +461,14 @@ TEST_F(TrbRuntimeTempBufferTest, FailedExecutionWithoutASnapshotKeepsItsExecutio
     ASSERT_NE(header, nullptr);
     header->orch_error_code.store(SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, std::memory_order_relaxed);
 
-    // The header's code is not read at all on the runtime that admits a
-    // launched successor: the header is one instance across runs, so the
-    // successor resets and refills it as soon as this run's boundary releases
-    // it, and that boundary is the same fence that lets this call proceed. The
-    // run keeps the execution error its caller already holds.
-    if (kReadsOnlyTheRunOwnedRecord) {
-        EXPECT_EQ(finish_run(runtime, -1), 0);
-        EXPECT_EQ(fake_.copy_from_count, 0);
-    } else {
-        EXPECT_EQ(finish_run(runtime, -1), -SIMPLER_ERROR_EXPLICIT_ORCH_FATAL);
-        EXPECT_EQ(fake_.copy_from_count, 1);
-    }
+    // The header's code is not read at all: the header is one instance across
+    // runs, so a launched successor resets and refills it as soon as this run's
+    // boundary releases it, and that boundary is the same fence that lets this
+    // call proceed. The run keeps the execution error its caller already holds.
+    // Both runtimes declare joined launch, so both answer this way; the planted
+    // code above is what a header read would wrongly report as this run's.
+    EXPECT_EQ(finish_run(runtime, -1), 0);
+    EXPECT_EQ(fake_.copy_from_count, 0);
     // The failure skips the tensor copy-back either way, so the caller's buffer
     // keeps its own content rather than whatever the device slice held.
     EXPECT_TRUE(std::all_of(output.begin(), output.end(), [](uint8_t value) {
@@ -454,13 +495,10 @@ TEST_F(TrbRuntimeTempBufferTest, FailedExecutionTreatsAShortTerminalRecordAsNone
     ASSERT_NE(header, nullptr);
     header->orch_error_code.store(SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, std::memory_order_relaxed);
 
-    if (kReadsOnlyTheRunOwnedRecord) {
-        EXPECT_EQ(finish_run(runtime, -1), 0);
-        EXPECT_EQ(fake_.copy_from_count, 0);
-    } else {
-        EXPECT_EQ(finish_run(runtime, -1), -SIMPLER_ERROR_EXPLICIT_ORCH_FATAL);
-        EXPECT_EQ(fake_.copy_from_count, 1);
-    }
+    // Unreadable reads as absent on both runtimes, and absent leaves the
+    // execution error standing without the header's planted code reaching it.
+    EXPECT_EQ(finish_run(runtime, -1), 0);
+    EXPECT_EQ(fake_.copy_from_count, 0);
 }
 
 // The retained buffer is malloc'd once for the run and sliced, not per tensor.
@@ -489,6 +527,34 @@ TEST_F(TrbRuntimeTempBufferTest, TemporaryBufferSlicesWithoutChangingCopies) {
     EXPECT_EQ(fake_.device_free_count, 0);
     EXPECT_EQ(fake_.copy_from_count, 1);
     EXPECT_NE(fake_.retained_addr, nullptr);
+}
+
+TEST_F(TrbRuntimeTempBufferTest, MixedHostAndDeviceArgsOnlyLeaseHostSlices) {
+    fake_.reset();
+    Runtime runtime = make_runtime();
+    std::vector<uint8_t> host_input(64, 7);
+    std::vector<uint8_t> device_input(64, 9);
+    std::vector<uint8_t> host_output(64, 0);
+    ChipStorageTaskArgs args;
+    args.add_tensor(make_tensor(host_input));
+    args.add_tensor(make_tensor(device_input, true));
+    args.add_tensor(make_tensor(host_output));
+    ArgDirection signature[3] = {ArgDirection::IN, ArgDirection::IN, ArgDirection::OUT};
+
+    ASSERT_EQ(bind_runtime(runtime, api_, args, signature, 3), 0);
+    ASSERT_EQ(runtime.tensor_leases_.size(), 2u);
+    EXPECT_EQ(runtime.tensor_leases_[0].host_ptr, host_input.data());
+    EXPECT_EQ(runtime.tensor_leases_[0].release_kind, TensorReleaseKind::BufferNoop);
+    EXPECT_EQ(runtime.tensor_leases_[1].host_ptr, host_output.data());
+    EXPECT_EQ(runtime.tensor_leases_[1].release_kind, TensorReleaseKind::BufferNoop);
+    EXPECT_EQ(fake_.device_malloc_count, 1);
+    EXPECT_EQ(fake_.retained_size, align_up(64, kAlign) * 2 + kAlign - 1);
+
+    ASSERT_EQ(stage_inputs(runtime), 0);
+    EXPECT_EQ(fake_.copy_to_count, 2);
+    ASSERT_EQ(finish_run(runtime, 0), 0);
+    EXPECT_EQ(fake_.copy_from_count, 1);
+    EXPECT_EQ(fake_.device_free_count, 0);
 }
 
 TEST_F(TrbRuntimeTempBufferTest, SecondSameShapeRunReusesRetainedBuffer) {
@@ -814,6 +880,116 @@ TEST_F(TrbRuntimeTempBufferTest, PreparedRuntimeEnvRequiresTheActiveArenaKey) {
     EXPECT_NE(fake_.observed_key, fake_.compatibility_key);
 }
 
+// Contract row 4, the clause the cache exists for: a queued run whose sizing matches the active
+// arena **writes no byte of it**.
+//
+// The shape of the path, which is why the assertion is where it is.
+// `bind_callable_to_runtime_impl` probes the prebuilt-arena cache first;
+// `bind_cached_runtime_image` only wires three pointers on a hit, and
+// `build_and_cache_prebuilt_arena` — the only thing that sets a static arena up and the only
+// `copy_to_device` of the arena image — runs on a miss alone. So the claim is not that a bind
+// never writes: it is that the *second and later* compatible binds do not, while the first
+// builds and uploads.
+//
+// Eight compatible runs after the warm one, every one of them still bound: the whole point is a
+// queue of live runs sharing one arena, so none is released until they all are. What is asserted
+// of each is that it was wired to the cached arena, by address, rather than merely not having
+// failed.
+TEST_F(TrbRuntimeTempBufferTest, CompatibleRetainedBindsReuseTheArenaWithoutWritingIt) {
+    fake_.reset();
+    // A real cache: the default hooks record nothing and answer with placeholders, so every bind
+    // would take the miss path and this case would be about nothing.
+    fake_.cache_recording = true;
+    ArgDirection signature[2] = {ArgDirection::IN, ArgDirection::OUT};
+
+    // Every run has its own storage, identical in shape, so the retained temp buffer never grows
+    // after the first and a later allocation would be a finding rather than noise.
+    constexpr size_t kRetained = 8;
+    std::vector<std::vector<uint8_t>> inputs(kRetained + 1, std::vector<uint8_t>(64, 3));
+    std::vector<std::vector<uint8_t>> outputs(kRetained + 1, std::vector<uint8_t>(64, 0));
+    // Child-memory inputs and plain outputs: neither is staged at bind, so any `copy_to` below
+    // is the arena image and nothing else. A host input's own staging is checked at the end,
+    // because a bind that stopped copying *those* would be a different defect.
+    auto args_for = [&](size_t index) {
+        ChipStorageTaskArgs args;
+        args.add_tensor(make_tensor(inputs[index], /*child_memory=*/true));
+        args.add_tensor(make_tensor(outputs[index]));
+        return args;
+    };
+
+    // The warm run: a miss, so it builds the arena, uploads it, and records the entry.
+    std::vector<Runtime> runtimes(kRetained + 1);
+    ChipStorageTaskArgs warm_args = args_for(0);
+    ASSERT_EQ(bind_runtime(runtimes[0], api_, warm_args, signature, 2), 0);
+    ASSERT_EQ(fake_.cache_miss_count, 1) << "the warm bind found an entry it could not have stored yet";
+    ASSERT_EQ(fake_.cache_store_count, 1) << "the warm bind did not record what it built";
+    ASSERT_EQ(fake_.setup_static_arena_count, 1);
+    ASSERT_FALSE(fake_.runtime_arena.empty());
+    ASSERT_EQ(fake_.cached_runtime_arena, fake_.runtime_arena.data());
+    const int copies_after_warm = fake_.copy_to_count;
+    ASSERT_GE(copies_after_warm, 1) << "the warm bind never uploaded an arena image to skip later";
+    const int mallocs_after_warm = fake_.device_malloc_count;
+    const int frees_after_warm = fake_.device_free_count;
+    const int memsets_after_warm = fake_.device_memset_count;
+    void *const arena_addr = fake_.runtime_arena.data();
+    void *const cached_sm = fake_.cached_gm_sm;
+    const size_t cached_off = fake_.cached_runtime_off;
+
+    // A pattern over the whole arena, so a later write is detectable byte for byte rather than
+    // only through a counter. Nothing in this fixture executes a device, so the contents are
+    // this case's to own from here.
+    std::vector<uint8_t> sentinel(fake_.runtime_arena.size());
+    for (size_t index = 0; index < sentinel.size(); index++) {
+        sentinel[index] = static_cast<uint8_t>(0xA5u ^ (index & 0xFFu));
+    }
+    fake_.runtime_arena = sentinel;
+    ASSERT_EQ(fake_.runtime_arena.data(), arena_addr) << "overwriting the arena moved it; the sentinel is not in "
+                                                         "the storage the cache recorded";
+
+    std::vector<ChipStorageTaskArgs> retained_args;
+    retained_args.reserve(kRetained);
+    for (size_t index = 1; index <= kRetained; index++) {
+        retained_args.push_back(args_for(index));
+        ASSERT_EQ(bind_runtime(runtimes[index], api_, retained_args.back(), signature, 2), 0)
+            << "compatible run " << index << " failed to bind while " << index << " earlier runs were still bound";
+        // Wired to the cached arena, by address: a bind that quietly rebuilt would answer here
+        // with storage of its own.
+        EXPECT_EQ(runtimes[index].get_prebuilt_arena_base(), arena_addr) << "run " << index << " bound its own arena";
+        EXPECT_EQ(runtimes[index].get_prebuilt_runtime_offset(), cached_off);
+        EXPECT_EQ(runtimes[index].get_gm_sm_ptr(), cached_sm);
+        EXPECT_EQ(fake_.cache_hit_count, static_cast<int>(index)) << "run " << index << " did not hit the cache";
+        EXPECT_EQ(fake_.cache_miss_count, 1) << "run " << index << " probed as a miss";
+    }
+
+    // Nothing of the arena moved, was rebuilt, re-uploaded or re-recorded.
+    EXPECT_EQ(fake_.copy_to_count, copies_after_warm)
+        << kRetained << " compatible binds uploaded an arena image between them";
+    EXPECT_EQ(fake_.setup_static_arena_count, 1) << "a compatible bind set a static arena up again";
+    EXPECT_EQ(fake_.cache_store_count, 1) << "a compatible bind replaced the entry it hit";
+    EXPECT_EQ(fake_.device_memset_count, memsets_after_warm) << "a compatible bind cleared device storage";
+    EXPECT_EQ(fake_.device_malloc_count, mallocs_after_warm) << "a compatible bind of the same shape allocated again";
+    EXPECT_EQ(fake_.device_free_count, frees_after_warm);
+    EXPECT_EQ(fake_.runtime_arena.data(), arena_addr) << "the arena the cache recorded was reallocated underneath it";
+    EXPECT_EQ(fake_.runtime_arena, sentinel) << "a compatible bind wrote into the arena a live run is using";
+
+    // And the other half of the claim: a host input's own staging still moves its bytes. The
+    // clause is about the arena, not about forbidding every H2D a run legitimately needs.
+    std::vector<uint8_t> host_input(64, 9);
+    std::vector<uint8_t> host_output(64, 0);
+    Runtime staged_runtime = make_runtime();
+    ChipStorageTaskArgs staged_args = make_args(host_input, host_output);
+    ASSERT_EQ(bind_runtime(staged_runtime, api_, staged_args, signature, 2), 0);
+    EXPECT_EQ(fake_.copy_to_count, copies_after_warm) << "the bind moved the input's bytes; staging does that";
+    ASSERT_EQ(stage_inputs(staged_runtime), 0);
+    EXPECT_GT(fake_.copy_to_count, copies_after_warm) << "a host input was never staged";
+    EXPECT_EQ(fake_.runtime_arena, sentinel) << "staging a host input wrote into the shared arena";
+
+    ASSERT_EQ(finish_run(staged_runtime, 0), 0);
+    for (size_t index = 0; index <= kRetained; index++) {
+        ASSERT_EQ(finish_run(runtimes[index], 0), 0) << "run " << index << " did not release its bindings";
+    }
+}
+
 namespace {
 
 CallConfig small_kernel_config() {
@@ -875,7 +1051,12 @@ TEST(KernelPipelineBuilder, DefaultAndPackedInputsPreserveProgramContract) {
     EXPECT_EQ(packed, before);
     expect_same_contract(*get_pipeline_contract(), program_before);
     EXPECT_TRUE(is_valid_pipeline_contract(get_pipeline_contract()));
-    EXPECT_EQ(get_pipeline_contract()->pipeline_depth, 2u);
+    // The program declares no depth limit of its own: one shared scratch serves any number of runs
+    // because the AICPU stream is a FIFO and that order is transitive, so what bounds concurrency
+    // is the per-run task-args region — one per set a context was granted. The kernel contract
+    // asserted above still declares two, which is why both are checked here rather than one
+    // standing in for the other.
+    EXPECT_EQ(get_pipeline_contract()->pipeline_depth, UINT32_MAX);
 }
 
 TEST(KernelPipelineBuilder, InvalidSizesLeaveOutputUntouched) {
@@ -1082,4 +1263,21 @@ TEST_F(TrbRuntimeTempBufferTest, AcceptsOverlappingReadOnlyH2dCopies) {
     args.add_tensor(tensor);
     const ArgDirection sig[] = {ArgDirection::IN, ArgDirection::IN};
     EXPECT_EQ(bind_runtime(runtime, api_, args, sig, 2), 0);
+}
+
+TEST_F(TrbRuntimeTempBufferTest, ManagedResourceStatusesSurviveBothAdapterBridges) {
+    for (int status : {SIMPLER_RUNTIME_ERR_RESOURCE_WAIT, SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE}) {
+        Runtime runtime = make_runtime();
+        ChipStorageTaskArgs empty_args;
+        fake_.arena_status = status;
+        EXPECT_EQ(bind_runtime(runtime, api_, empty_args, nullptr, 0), status);
+        EXPECT_EQ(fake_.copy_to_count, 0);
+        fake_.arena_status = 0;
+        fake_.staging_status = status;
+        ChipStorageTaskArgs host_args;
+        host_args.add_tensor(null_source_tensor(16));
+        const ArgDirection signature[] = {ArgDirection::IN};
+        EXPECT_EQ(bind_runtime(runtime, api_, host_args, signature, 1), status);
+        EXPECT_EQ(fake_.copy_to_count, 0);
+    }
 }

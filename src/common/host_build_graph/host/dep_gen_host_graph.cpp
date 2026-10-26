@@ -29,7 +29,7 @@
  * five vectors rather than a copy. The serializer lives in that same header.
  */
 
-#include "host_build_graph/dep_gen_host_graph.h"
+#include "host_build_graph/host/dep_gen_host_graph.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -371,6 +371,16 @@ extern "C" int dep_gen_host_graph_take(hg::HostGraphExport *out) {
     // A task opened and never closed means the graph is missing whatever edges
     // that task would have contributed, and the format has nowhere to say so.
     return static_cast<int>(task_left_open ? hg::TakeOutcome::Incomplete : hg::TakeOutcome::Complete);
+}
+
+extern "C" void dep_gen_host_graph_restore_for_export(hg::HostGraphExport *graph, int outcome) {
+    HostGraphState &s = state();
+    s.reset();
+    if (graph == nullptr || outcome == static_cast<int>(hg::TakeOutcome::NotCaptured)) return;
+    s.graph = std::move(*graph);
+    s.capture_open = true;
+    s.captured = !s.graph.tasks.empty();
+    s.in_task = outcome == static_cast<int>(hg::TakeOutcome::Incomplete);
 }
 
 extern "C" int dep_gen_host_graph_emit(const char *deps_json_path) {

@@ -237,7 +237,7 @@ public:
     // the event type reaches the device header and the CSV header string.
     int init(
         int num_cores, int num_threads, const PmuAllocCallback &alloc_cb, PmuRegisterCallback register_cb,
-        const PmuFreeCallback &free_cb, int device_id
+        const PmuFreeCallback &free_cb, int device_id, PmuUnregisterCallback unregister_cb = nullptr
     );
 
     // Start a run's collection window: bind its CSV destination and event

@@ -141,8 +141,6 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     while (true) {
         reg_val = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
         if (reg_val == AICORE_EXIT_SIGNAL) {
-            // Signal exit acknowledgment to AICPU
-            write_reg(RegId::COND, AICORE_EXITED_VALUE);
             break;
         }
 
@@ -241,7 +239,6 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                     SPIN_WAIT_HINT();
                 }
                 if (exiting) {
-                    write_reg(RegId::COND, AICORE_EXITED_VALUE);
                     break;
                 }
                 // Re-stamp receive_time at the moment the doorbell landed: the
@@ -312,8 +309,8 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
     // Flush all dirty cache lines to HBM before kernel exit.
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
-    // EXITED acknowledges quiescence; the AICPU opens this gate only after it
+    // The exit acknowledgement follows quiescence; the AICPU opens the gate after it
     // has closed this core's fast-path window. The gate is a line of its own,
     // outside the Handshake the dcci above writes back.
-    wait_for_post_close_release(&runtime->dev.teardown_gates[block_idx].post_close_release);
+    acknowledge_aicore_cond_nonce_and_wait(&runtime->dev.teardown_gates[block_idx]);
 }

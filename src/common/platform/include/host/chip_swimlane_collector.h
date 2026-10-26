@@ -137,6 +137,31 @@ struct ChipSwimlaneModule {
     static constexpr int kMaxCollectorThreads = PLATFORM_MAX_AICPU_THREADS;
 
     /**
+     * How many retained runs this collector's storage is *built* for, and how
+     * many transport cuts may be armed beside them.
+     *
+     * Swimlane's own ceiling, deliberately not `dfx::runs::kMaxOpenEpochs`:
+     * that constant is shared with five other collector families, and every one
+     * of them sizes an array and a fixed-budget term from it. Raising it there
+     * would change their approved limits; raising it here changes only this
+     * collector.
+     *
+     * The ceiling is what the arrays are sized to. How many of those slots a
+     * given collector may actually use is `active_epoch_limit()`, which a
+     * backend grants once before this collector is initialized and which
+     * defaults to `dfx::runs::kMaxOpenEpochs` — so a collector nobody grants
+     * anything to behaves exactly as it does today.
+     *
+     * Cuts match epochs because a cut is armed at `run_close` and released only
+     * once the writer reaches a terminal verdict: with N runs admitted, N may
+     * be closed and unpublished at once. Fewer cuts than epochs would not
+     * refuse — `cut_arm` returning -1 downgrades that run to `CutUnknown` —
+     * so the two counts are kept equal rather than tuned.
+     */
+    static constexpr size_t kMaxOpenEpochs = 3;
+    static constexpr size_t kMaxCutSlots = kMaxOpenEpochs;
+
+    /**
      * Startup-only batch allocation size for proactive_replenish. Sched and
      * orch phase pools are sized independently
      * (PLATFORM_PROF_{SCHED,ORCH}_BUFFERS_PER_THREAD).
@@ -489,7 +514,7 @@ public:
     int initialize(
         int num_aicore, int aicpu_thread_num, int device_id, ChipSwimlaneLevel chip_swimlane_level,
         const ChipSwimlaneAllocCallback &alloc_cb, ChipSwimlaneRegisterCallback register_cb,
-        const ChipSwimlaneFreeCallback &free_cb
+        const ChipSwimlaneFreeCallback &free_cb, ChipSwimlaneUnregisterCallback unregister_cb = nullptr
     );
 
     /**
@@ -818,6 +843,80 @@ public:
     void *arm_run_terminal_bank(uint32_t bank_index, uint64_t run_epoch);
 
     /**
+     * Take a terminal bank for `run_epoch`, or report that none is free.
+     *
+     * The banks are a fixed device resource and a run is not: a bank is held by
+     * whichever epoch acquired it until that run's report releases it, so the
+     * mapping is by epoch and not by the set a run happens to borrow. Asking
+     * again for an epoch that already holds one answers with the same bank,
+     * which is what makes arming idempotent across a re-prepare.
+     *
+     * Returns the bank index, or -1 when every bank is held. A caller that gets
+     * -1 has not lost its diagnostic: the banks come back as runs retire, so
+     * the question is asked again next round rather than answered once.
+     */
+    int acquire_run_terminal_bank(uint64_t run_epoch);
+
+    /** Which bank `run_epoch` holds, or -1 when it holds none. */
+    int run_terminal_bank_of(uint64_t run_epoch) const;
+
+    /**
+     * Whether `run_epoch` could take a terminal bank right now.
+     *
+     * The question a scheduling round asks before ordering a further diagnostic
+     * run behind the ones already open: a run with no bank would publish no
+     * snapshot, so it waits for one instead of launching without it. Asked
+     * again every round, and the banks come back as runs retire.
+     */
+    bool can_take_run_terminal_bank(uint64_t run_epoch) const;
+
+    /**
+     * Give back the bank `run_epoch` held, so another run may take it.
+     *
+     * Only for a run whose bank is proved finished with: its snapshot has been
+     * consumed — reported, or copied into the epoch's own bucket — or it never
+     * submitted anything, so no producer can be holding the address. Those are
+     * the proofs that the *data* is done with; `discard_run_terminal_bank` adds
+     * the one for a run whose data is worthless but whose producers are proved
+     * gone. A run whose completion is merely unobserved is quarantined instead.
+     */
+    void release_run_terminal_bank(uint64_t run_epoch);
+
+    /**
+     * Give back the bank `run_epoch` held without reading it, on proof that
+     * every producer that could write into it has terminated.
+     *
+     * The failed-run counterpart of `release_run_terminal_bank`. What the bank
+     * holds is not this run's accounting — the run never reached its terminal
+     * publication, so the entries are whatever its producers managed before the
+     * failure, mixed with whatever the previous occupant left. None of it is
+     * read: no consumer is waiting on it, the host never copies it, and an entry
+     * that outlives this epoch is counted as foreign by the next occupant's
+     * snapshot, which compares each entry's own stamp. So the storage is free
+     * and saying so costs nothing but the bytes.
+     *
+     * The proof is the caller's and it is about producers, not about success:
+     * a simulated device's producers are host threads, and joining them
+     * establishes that none remains. A real device's do not become observable
+     * this way — there the answer is `quarantine_run_terminal_bank`.
+     */
+    void discard_run_terminal_bank(uint64_t run_epoch);
+
+    /**
+     * Withdraw the bank `run_epoch` held, without returning it.
+     *
+     * For a run that reached the device and whose producers could not be proved
+     * stopped. The AICPU may still be writing into that bank, so handing it to
+     * another run would let two producers share it and would publish one run's
+     * accounting as another's. A quarantined bank is never reissued; it comes
+     * back only when the region itself goes, at `finalize`.
+     */
+    void quarantine_run_terminal_bank(uint64_t run_epoch);
+
+    /** How many banks are withdrawn, for a caller reporting degraded capacity. */
+    int quarantined_run_terminal_banks() const;
+
+    /**
      * Read back the snapshot armed for `run_epoch` at `bank_index`.
      *
      * Only sound after that run's completion has been established positively —
@@ -1015,6 +1114,63 @@ public:
     }
 
     /**
+     * Substitute how the run writer's thread is obtained.
+     *
+     * `start_run_writer()` has exactly one construction point, and this is it.
+     * A factory that throws there is the only way to reach the preparation's
+     * rollback: no caller can make a thread fail to spawn, and the rollback is
+     * what keeps a collector whose writer never started from claiming to
+     * retain. Unset in production, where the writer is the same plain
+     * `std::thread` it has always been.
+     *
+     * Read on the lane that prepares retention, so it must be set before the
+     * first admission and not moved while one is in flight.
+     */
+    void set_writer_thread_factory_for_test(std::function<std::thread(std::function<void()>)> factory) {
+        writer_thread_factory_ = std::move(factory);
+    }
+
+    /** One open epoch's run-local metadata, as its admission captured it. */
+    struct PendingRunMetadata {
+        bool found{false};
+        std::vector<CoreType> core_types;
+        bool host_orchestrated{false};
+    };
+    /**
+     * Inspection only, and only for an epoch this caller has admitted and not
+     * yet closed.
+     *
+     * `run_close` hands the bucket to the writer, which may publish it and
+     * return the slot to `Free` at any moment after that; `retained_mu_` makes
+     * one bucket's read internally consistent but does not extend its life. So
+     * an epoch is readable here strictly between its `run_begin` and its
+     * `run_close` -- after the close, a run's own artifact is what says what it
+     * recorded.
+     */
+    PendingRunMetadata pending_metadata_for_test(uint64_t run_epoch) const {
+        PendingRunMetadata out;
+        std::lock_guard<std::mutex> lk(retained_mu_);
+        for (const auto &bucket : retained_runs_) {
+            if (bucket.state.load(std::memory_order_acquire) == static_cast<int>(EpochState::Free)) continue;
+            if (bucket.epoch.load(std::memory_order_acquire) != run_epoch) continue;
+            out.found = true;
+            out.core_types = bucket.pending.core_types;
+            out.host_orchestrated = bucket.pending.host_orchestrated;
+            break;
+        }
+        return out;
+    }
+
+    /**
+     * The host bytes retention reserves before it admits anything.
+     *
+     * Fixed once the collector is sized, so it is meaningful only between
+     * `initialize()` and the first admission -- which is where a caller choosing
+     * a budget needs it.
+     */
+    size_t retained_fixed_overhead_for_test() const { return retained_fixed_overhead(); }
+
+    /**
      * One completed run's diagnostic data, owned by that run.
      *
      * A plain owned value: every field is held by value, the record streams are
@@ -1072,6 +1228,15 @@ public:
         // byte-for-byte, which is what makes the default path unchanged.
         std::string artifact_path;
         simpler::dfx::runs::CollectionVerdict collection{};
+        /**
+         * The submission this run's records belong to.
+         *
+         * Owned here, inside the bucket's export, because the writer publishes
+         * from `bucket.pending` and must not reach back into any caller's
+         * storage. An all-zero `owner_instance_id` means the admitting caller
+         * stated no identity, which is the only state a reader may not match on.
+         */
+        NativeRunArtifactIdentity artifact_identity{};
     };
 
     /**
@@ -1244,7 +1409,7 @@ private:
         RecordsByCollector<CollectedRecord<ChipSwimlaneAicpuOrchPhaseRecord>> orch_phase;
         std::vector<CollectorShardCounters> counters;
     };
-    std::array<EpochStore, simpler::dfx::runs::kMaxOpenEpochs> epoch_stores_{};
+    std::array<EpochStore, ChipSwimlaneModule::kMaxOpenEpochs> epoch_stores_{};
 
     EpochStore &store(size_t slot) { return epoch_stores_[slot < epoch_stores_.size() ? slot : 0]; }
     const EpochStore &store(size_t slot) const { return epoch_stores_[slot < epoch_stores_.size() ? slot : 0]; }
@@ -1323,6 +1488,20 @@ private:
     // verdict rather than inheriting the previous run's identity.
     uint64_t armed_run_epoch_{0};
 
+    // Which run holds each terminal bank, or 0 for a free one. The banks are a
+    // fixed device resource and a run is not, so a bank is keyed by the epoch
+    // that acquired it and comes back when that run's snapshot has been
+    // reported, or when its producers are proved stopped and the snapshot is
+    // discarded. Keyed by epoch rather than by the run-resource set a run
+    // borrows: the sets are as many as the grant allows and the banks are
+    // three, so the two counts do not have to agree for either to be correct.
+    uint64_t bank_epoch_[PLATFORM_RUN_TERMINAL_BANKS]{};
+    // A bank whose holder could not prove its device work finished *and* could
+    // not prove its producers stopped. Never reissued: a producer may still be
+    // writing into it, and the host cannot tell from here. Cleared only by
+    // `finalize`, where the region goes away.
+    bool bank_quarantined_[PLATFORM_RUN_TERMINAL_BANKS]{};
+
     // Per-class handoff receipt, summed from the shards at merge time.
     HandoffReceipt merged_receipt_[kProducerClasses]{};
     uint64_t merged_presented_buffers_{0};
@@ -1338,8 +1517,31 @@ private:
      * decide whose it was. Published on every run sealed while it is non-zero,
      * as a completeness statement about that run rather than a count of its
      * own losses.
+     *
+     * Cleared exactly once, at the first successful retention setup, so losses
+     * counted before this collector ever retained a run cannot downgrade the
+     * artifacts of runs it retains afterwards. See `ever_retained_`.
      */
     std::atomic<uint64_t> unattributable_handoffs_{0};
+    /**
+     * Whether retention setup has ever completed successfully on this
+     * collector -- not whether an artifact was written, and not whether
+     * retention is configured on right now.
+     *
+     * It is the error-reporting policy boundary. While false, a hand-off this
+     * collector cannot charge is counted and logged and nothing is made sticky:
+     * a run that never retained answers for its own loss through its own
+     * artifact, and a later flush has nothing to add. Once true it stays true
+     * through disable, finalize, rebuild and every subsequent default-mode run,
+     * because a sticky failure recorded under retention has to remain
+     * observable after the configuration that produced it is gone.
+     *
+     * Published with release under `retained_mu_` at the tail of
+     * `ensure_retained_runs_ready`, after the writer has started -- readiness
+     * alone is not enough, because the writer spawn can still throw and take
+     * the whole preparation back down.
+     */
+    std::atomic<bool> ever_retained_{false};
     /** Reported once: this transport delivers hand-offs with no identity. */
     std::atomic<bool> unverified_handoff_reported_{false};
     mutable std::mutex pre_charge_hook_mu_;
@@ -1399,6 +1601,17 @@ private:
         // request says nothing about this capture.
         uint64_t cut_request{0};
         std::chrono::steady_clock::time_point closed_at{};
+        /**
+         * The directory this run's artifact is published into.
+         *
+         * Reserved for this run alone, from its own output prefix, at
+         * admission: a Worker that changes its prefix between submissions
+         * writes each run where that run asked, and every artifact sits beside
+         * the dispatch companions its own submission produced. One run owns it
+         * outright, so withdrawing that run can give it back without consulting
+         * any other. Empty means nothing is reserved and nothing is owed.
+         */
+        std::string artifact_dir;
         // Everything the writer needs, captured at run_close while the device
         // state is still this run's.
         RunExport pending{};
@@ -1406,6 +1619,17 @@ private:
         AicoreAccounting aicore{};
         RunTerminalSnapshot terminal{};
         bool terminal_ok{false};
+        /**
+         * Whether this run's admission-time metadata was fully kept.
+         *
+         * False when the budget refused the core-type copy at `run_begin`. It
+         * has to be remembered rather than re-derived at close: the close-time
+         * charge is a different allocation, and a sibling bucket publishing in
+         * between can credit enough for it to succeed. Without this the
+         * artifact would claim complete metadata for a run whose core types
+         * were dropped.
+         */
+        bool admission_metadata_complete{true};
         /**
          * Guards this bucket's loss accounting as one unit: the identity it is
          * being charged against, what that identity may still accept, and the
@@ -1457,7 +1681,7 @@ private:
             int slot{-1};
             bool retain{true};
         };
-        std::array<Entry, simpler::dfx::runs::kMaxOpenEpochs> entries{};
+        std::array<Entry, ChipSwimlaneModule::kMaxOpenEpochs> entries{};
         size_t count{0};
 
         int slot_for(uint64_t epoch, bool *retain_out) const {
@@ -1515,8 +1739,49 @@ public:
      */
     void configure_retained_runs(bool retain_across_runs, size_t budget_bytes);
 
+    /**
+     * Raise how many runs this collector may hold open at once.
+     *
+     * Returns false and changes **nothing** unless every condition holds: the
+     * limit is between the shared default and this module's ceiling, the
+     * collector has not been initialized, no reader or writer thread has been
+     * started, retention has not been prepared, and no slot holds a run. Those
+     * are checked before the single write, so a refusal leaves the previous
+     * grant, the budget and the arrays exactly as they were — a caller that
+     * reaches this through the C API cannot resize a collector that is already
+     * serving runs, and does not have to be trusted to call it early.
+     *
+     * Granting more does not open a wider launch: it answers what this
+     * collector can hold, and the backend decides separately whether a run may
+     * be ordered behind another.
+     */
+    bool set_retained_epoch_limit(size_t limit);
+
+    /** How many runs this collector may hold open at once. */
+    size_t active_epoch_limit() const { return active_epoch_limit_; }
+
     /** Whether this collector is configured to hold a run past its boundary. */
     bool retains_runs() const { return retain_across_runs_; }
+
+    /**
+     * Whether this collector has ever completed retention setup.
+     *
+     * The reporting-policy boundary, not a configuration read: it never goes
+     * back to false, so a caller that consults a sticky failure gate must use
+     * this rather than `retains_runs()`, which a rebuild can turn off while the
+     * failure it hid is still unreported.
+     */
+    bool ever_retained() const { return ever_retained_.load(std::memory_order_acquire); }
+
+    /**
+     * Whether this collector is ready to admit a retained run right now.
+     *
+     * Readiness, fatality and free capacity are three separate facts and a
+     * caller that wants to know whether a run may be admitted needs all of
+     * them. `can_admit_retained_run()` answers the conjunction under the one
+     * mutex that makes it consistent.
+     */
+    bool can_admit_retained_run() const;
 
     /**
      * Open one run's window on a collector that retains runs.
@@ -1532,8 +1797,18 @@ public:
      * refusal as "take the single-run path" would run `begin_run()`, whose
      * reset drops the records a predecessor is still publishing. So a refusal
      * fails the run.
+     *
+     * `core_types` and `host_orchestrated` are this run's own, taken at
+     * admission rather than at close. The resident copies a close would read
+     * are written by whichever run launched last, so under an early-enqueued
+     * successor a predecessor's close would publish its successor's core types;
+     * the bucket owns them from here instead. `core_types` may be empty when
+     * the caller has none, in which case the bucket keeps none.
      */
-    bool run_begin(uint64_t run_epoch, const std::string &output_prefix, ChipSwimlaneLevel level);
+    bool run_begin(
+        uint64_t run_epoch, const std::string &output_prefix, ChipSwimlaneLevel level, const CoreType *core_types,
+        int core_type_count, bool host_orchestrated, const NativeRunArtifactIdentity *artifact_identity = nullptr
+    );
 
     /**
      * Install this run's target and hand it to the writer.
@@ -1541,8 +1816,20 @@ public:
      * Called on the teardown thread while the run still holds its execution
      * claim, which is what makes the per-queue capture consistent: the device
      * has stopped and the successor has not launched.
+     *
+     * The terminal bank is resolved from `run_epoch` here rather than taken as
+     * an argument: a bank is held by the epoch that acquired it, so no caller
+     * can be in a position to name the right index, and one passing a run's
+     * resource-set index would read another run's accounting. This also settles
+     * the bank, and the two facts it settles it on are separate:
+     * `device_execution_complete` decides whether the snapshot is *valid* to
+     * read, and `device_producers_stopped` decides whether the bank is *safe*
+     * to hand on. A completed run is both. A failed run whose every producer is
+     * proved terminated — which a simulated device can establish by joining the
+     * threads that are its producers, and a real one cannot — reads nothing and
+     * still returns the bank. Only a run that is neither is quarantined.
      */
-    void run_close(uint64_t run_epoch, uint32_t bank_index, bool device_execution_complete);
+    void run_close(uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped = false);
 
     /**
      * Withdraw a run that was admitted and never launched.
@@ -1639,17 +1926,27 @@ public:
     RetainedRunStats retained_run_stats_for_test() const;
 
 private:
+    /**
+     * Take one unused `swimlane-<k>` under `output_root`, by exclusive creation.
+     *
+     * `mkdir` fails EEXIST without a window, so two processes sharing a root
+     * take different directories by construction and no index is derived from
+     * a pid, which repeats. One run owns what this reserves: `run_begin` calls
+     * it once per admission, so a withdrawal can give the directory back
+     * without asking whether another run is publishing into it.
+     */
     bool reserve_artifact_directory(const std::string &output_root, std::string *reserved_dir);
 
     /**
      * Take everything retaining a run needs, on the first run that needs it.
      *
-     * Lazy because `initialize()` is given no output prefix, and reserving a
-     * directory for a run that arms and then fails to launch would leave one
-     * behind. Readiness is the single `retained_ready_` latch and it is
-     * published last: every step before it either succeeded or undid itself,
-     * and a step that fails after the latch undoes the whole preparation, so
-     * no half-prepared collector can be mistaken for a prepared one.
+     * Lazy because `initialize()` is given no output prefix and the budget this
+     * takes is sized against one. It reserves no directory: that is per run, in
+     * `run_begin`, under the prefix that run itself named. Readiness is the
+     * single `retained_ready_` latch and it is published last: every step
+     * before it either succeeded or undid itself, and a step that fails after
+     * the latch undoes the whole preparation, so no half-prepared collector can
+     * be mistaken for a prepared one.
      */
     bool ensure_retained_runs_ready(const std::string &output_root);
 
@@ -1790,14 +2087,32 @@ private:
     std::atomic<bool> retained_ready_{false};
     std::atomic<bool> fatal_{false};
     std::string fatal_reason_;
-    std::string artifact_dir_;
+    // Labels this collector incarnation in every artifact it writes. Each run's
+    // directory is its own and lives on its bucket; this is not a path.
     uint64_t artifact_dir_index_{0};
-    std::array<EpochBucket, simpler::dfx::runs::kMaxOpenEpochs> retained_runs_{};
+    std::array<EpochBucket, ChipSwimlaneModule::kMaxOpenEpochs> retained_runs_{};
+    /**
+     * How many of `retained_runs_` this collector may use.
+     *
+     * The arrays above are built to the module ceiling; this is the bound every
+     * admission, capacity answer, budget term and preparation loop reads. It
+     * stays at the shared default until a backend grants more through
+     * `set_retained_epoch_limit`, so an ungranted collector allocates, reserves
+     * and admits exactly what it does today — including never sizing the slots
+     * past it, which is what keeps the ceiling off the heap.
+     *
+     * Written once, before this collector is initialized and before any reader
+     * or writer thread exists; read without a lock everywhere after that.
+     */
+    size_t active_epoch_limit_{simpler::dfx::runs::kMaxOpenEpochs};
     std::array<ShardEpochView, profiling_common::BufferPoolManager<ChipSwimlaneModule>::kMaxCollectorShards>
         shard_views_{};
     mutable std::mutex retained_mu_;
     std::condition_variable retained_cv_;
     std::thread writer_thread_;
+    // Null in production: `start_run_writer()` then constructs the writer
+    // directly, as it always has. See `set_writer_thread_factory_for_test`.
+    std::function<std::thread(std::function<void()>)> writer_thread_factory_;
     // The writer's own loop condition, not a record of whether one exists:
     // `writer_thread_.joinable()` is that record, and the two are set and
     // cleared together so a failed spawn leaves neither.
@@ -1944,4 +2259,27 @@ private:
      * since `slot_for` is consulted first and answers for it.
      */
     void record_run_tombstone(uint64_t run_epoch);
+
+    /**
+     * Count one hand-off this collector cannot charge to a run, and say whether
+     * the caller owes a sticky error for it.
+     *
+     * The single policy decision point. Every write to
+     * `unattributable_handoffs_` goes through here, so the boundary between
+     * "this collector has never retained a run" and "it has" is one place and
+     * one lock rather than a condition repeated at each loss site.
+     *
+     * The decision is taken under `retained_mu_`, which is also what the first
+     * successful retention setup holds while it clears the counter and
+     * publishes the latch. A loss being counted therefore lands wholly before
+     * that clear or wholly after the transition; it can neither be erased
+     * halfway nor survive into the new policy uncounted.
+     *
+     * Returns false before the boundary: the loss is counted and the caller
+     * logs it, and nothing is recorded that a later flush would report. Returns
+     * true after it, and the caller records the sticky error itself -- outside
+     * this lock, because `ErrorSummary` has its own and a bucket's `loss_mu` is
+     * a leaf beneath neither.
+     */
+    bool charge_unattributable_handoff();
 };

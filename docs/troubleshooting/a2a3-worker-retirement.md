@@ -78,20 +78,25 @@ returns early simply never arrives. Before this handoff existed, missing the
 latch cost a leaked runtime context; with workers blocked on gates, it would
 cost every core on the chip.
 
-`platform_retire_aicore_group` retires one claimed set in passes:
+Retirement uses a current-response predicate, described in the
+[freshness contract](../hardware/cache-coherency.md#exit-acknowledgement-freshness).
+Native and unstamped runs use `platform_retire_aicore_group` after report
+acceptance and exclusive claim. The claimant chooses a reserved nonce different
+from this physical core's observed COND; Core echoes it only after completing
+preceding writes, then performs no subsequent SPR writes. Native report epochs
+retain their startup checks. Both request and return gate are reset before
+READY or EXIT; the control remains one AICPU-owned 64-byte line. Fixed EXITED
+alone is insufficient.
 
-1. Send EXIT to every core in the set before waiting for any ACK.
-2. Collect EXITED, using one shared deadline.
-3. Re-read the still-silent cores once. The shared deadline bounds the all-dead
-   case to a single timeout, but a core whose turn came after it expired never
-   got a wait of its own; this second read decides such a core on its own
-   evidence rather than on a peer's timeout.
-4. Reset dispatch to IDLE and close every acknowledged window. Read back the
-   MMIO window and complete that read before publishing a GM return gate.
-5. Store `AICORE_POST_CLOSE_RELEASE` to each closed core's gate. The stores are
-   relaxed: step 4's drain is what orders them after the CLOSE they belong to,
-   and the gates are independent of one another.
-6. AICore observes that word and only then returns.
+The helper retires one claimed set in passes:
+
+1. Publish each request before sending EXIT to every core in the set.
+2. Poll for each target's matching current response against one shared deadline.
+   A core that never responds remains unclosed and unreleased for host recovery.
+3. Reset dispatch to IDLE and close every acknowledged window. Read back the
+   MMIO windows, then drain those reads before publishing any GM return gate.
+4. Store `AICORE_POST_CLOSE_RELEASE` to each acknowledged core's gate.
+5. AICore observes that word, completes its final drain and only then returns.
 
 The AICore wait is unbounded on purpose. A bounded wait cannot help: below the
 45 s op-execute timeout it would return while the AICPU may still be writing —
@@ -121,6 +126,57 @@ This patch does not introduce a new reset operation or recovery policy.
 
 ## Cache-line and generation ownership
 
+### Requests during handshake
+
+Retirement also covers a fatal exit while another thread is still publishing
+its cores. Each scheduler core has two atomic bits, `READY` and `REQUESTED`,
+reset by the boot leader before handshake. `REQUESTED` is retained even when
+the core has no published execution state yet; testing `reg_addr == 0` before
+recording `REQUESTED` and skipping that core would lose the request.
+
+READY is published after core ownership and payload initialization complete,
+matching the A5 TMR initialization boundary. TMR's barrier-free path publishes
+each owned group at the end of `assign_own_clusters`; the serial TMR and HBG
+paths publish from the leader at the end of `post_handshake_init`, after all
+handshake publishers have joined. Opening a window and storing `CoreExecState`
+alone do not publish READY. The normal dispatch loop does not read these bits.
+
+Both READY and REQUESTED use `__atomic_fetch_or` with acquire-release ordering
+on a `uint8_t` array, as in A5 TMR. The boot leader clears that array before
+releasing any handshake thread. Whichever atomic operation adds the second bit
+owns retirement; the request path acquires the publisher's initialized state.
+Duplicate requests and normal/emergency overlap cannot elect another owner.
+
+Initialization failure must also publish the successfully opened windows.
+The serial initializer does so after joining every handshake, before emergency
+retirement. An owned-cluster assignment failure publishes its fixed blocked
+partition, even if its tracker could not be populated. This fallback publishes
+only nonzero initialized addresses; a core with an invalid physical identity,
+zero register address, or incomplete handshake remains for host recovery.
+
+An early REQUESTED therefore remains pending through initialization and is
+serviced by its publisher on success or failure. The retirement boundary retains
+the id/address checks after claiming, without turning an unpublished address
+into a discarded request. A silent core's claim remains consumed after timeout:
+a later request cannot close or release it without an ACK. Re-arming state and
+gates requires the preceding generation to have completed.
+
+Serial initialization publishes its initialized worker-id set; the barrier-free
+path publishes the owning thread's blocked cluster set. This enumeration follows
+the existing A2/A3 startup layouts without adding an all-thread barrier. Both
+sets use the same per-core ownership rule and existing group deadline,
+ACK/CLOSE/readback/drain and per-core return gates. A5's software register
+definitions and platform-specific CLOSE sequence are unchanged.
+
+The `test_a2a3_tmr_scheduler_retirement` and
+`test_a2a3_hbg_scheduler_retirement` tests run production handshake and scheduler
+retirement code with a recording platform sink. They pause after windows open
+but before execution state is published, and cover requests pending until
+ownership/payload initialization, initialization failure, ownership
+races, duplicate ids, partial timeout, zero-address rejection, and generation
+reset. These tests verify the scheduler handoff; the platform and worker tests below separately verify
+the ACK/CLOSE/return ordering.
+
 The return gate lives in `teardown_gates[]`, a separate array beside
 `workers[]` in the device-copied image — not inside `Handshake`:
 
@@ -137,10 +193,9 @@ gate line. `static_assert(sizeof(Handshake) == 64)` pins the report line, and
 `AicoreTeardownControl` is `alignas(64)` with its own size assertion.
 
 `Handshake` therefore keeps its 64-byte layout and stride. HBG shares that
-definition with A5, and A5 is unaffected: its handshake image is byte-for-byte
-what it was, and its execution protocol and the public Python API are
-unchanged. A5 does link the `teardown_gates[]` array — it grows the device
-image by one cache line per worker — but never reads or writes it.
+definition with A5. A5 TMR and HBG use the separate gate array as implemented in
+PR #2388; this A2/A3 change leaves their handshake layout, execution protocol,
+and public Python API unchanged.
 
 The boot leader zeroes the whole gate array before publishing handshake setup
 and before any register window opens; the write barrier that follows is what
@@ -164,7 +219,8 @@ invalid-target rejection.
 ```bash
 cmake -S tests/ut/cpp -B tests/ut/cpp/build
 cmake --build tests/ut/cpp/build --parallel 2 \
-  --target test_a2a3_tensormap_and_ringbuffer_retirement test_a2a3_host_build_graph_retirement
+  --target test_a2a3_tmr_aicore_retirement test_a2a3_hbg_aicore_retirement \
+  test_a2a3_tmr_scheduler_retirement test_a2a3_hbg_scheduler_retirement
 ctest --test-dir tests/ut/cpp/build -R '^test_a2a3_.*_retirement$' --output-on-failure
 ```
 

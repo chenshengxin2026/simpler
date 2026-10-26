@@ -40,6 +40,7 @@
 #include "common/host_phase_kind.h"
 #include "common/platform_config.h"
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
+#include "callable_limits.h"
 #include "task_args.h"
 #include "aicore_teardown.h"
 #include "common/launch_entry_args.h"     // LaunchEntryArgsPlan
@@ -51,7 +52,6 @@
 // =============================================================================
 
 #define RUNTIME_MAX_WORKER PLATFORM_MAX_CORES
-#define RUNTIME_MAX_FUNC_ID 1024
 
 // The AICore compiler defines these; host and AICPU builds compile the same
 // declarations with them empty. Mirrors the guard in the a5 scheduler's
@@ -125,8 +125,8 @@ struct Handshake {
 // The AICore owns this line's writeback: it flushes the whole line with
 // dcci(..., CACHELINE_OUT) on its report and again on exit. A word the AICPU
 // must publish independently cannot live here — a stale line writeback would
-// overwrite it. The A2/A3 post-close return gates live in
-// Runtime::teardown_gates, one isolated line each; A5 leaves them unused.
+// overwrite it. The post-close return gates live in
+// Runtime::teardown_gates, one AICPU-owned request/release line per worker on both platforms.
 static_assert(sizeof(Handshake) == 64);
 static_assert(std::is_standard_layout_v<Handshake> && std::is_trivially_copyable_v<Handshake>);
 // The payload offsets are the device-side wire contract: AICore writes them and
@@ -352,16 +352,14 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // what gives a fresh block a defined starting value.
     Handshake workers[RUNTIME_MAX_WORKER];
 
-    // A2/A3 post-close return gates, one isolated cache line per worker. The
+    // Post-close return gates, one isolated cache line per worker. The
     // AICPU stores here only after that worker's register window is closed;
     // the AICore bypass-loads its own entry and returns once it reads RELEASE.
     // Separate from workers[] because the AICore flushes its whole Handshake
-    // line, which would overwrite a gate sharing it. Unused reserved storage on
-    // A5 — a declared member that occupies layout, read and written by no A5
-    // code, and A5 runs no gate initialization.
+    // line, which would overwrite a gate sharing it.
     //
-    // Last, and outside both the uploaded prefix and the initialized prefix: on
-    // A2/A3 the AICPU zeroes every active entry in `pre_handshake_init` and
+    // Last, and outside both the uploaded prefix and the initialized prefix: the
+    // AICPU resets the active controls in `pre_handshake_init` and
     // executes `wmb()` before it publishes `hs_setup_done_`, and no register
     // window opens before that publication, so the meaningful initial value is
     // produced on the device ahead of every read of it. No host-supplied gate
@@ -369,6 +367,9 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // initialized — `Runtime()` does not touch it — so no host copy may reach
     // this range. `device_initialized_prefix_bytes()` ends where this array
     // begins; the allocation still covers it.
+    // Each 64-byte control is written only by AICPU and cleared before READY
+    // or EXIT. AICore bypass-loads the request and returns its nonce in COND;
+    // it never caches or writes the control.
     AicoreTeardownControl teardown_gates[RUNTIME_MAX_WORKER];
 };
 
@@ -551,6 +552,10 @@ public:
         host_.pending_publication_.prerequisites.push_back(
             {target, source, bytes, phase, std::move(attributes), std::move(storage)}
         );
+    }
+    using RunImagePublication = HostOnlyState::RunImagePublication;
+    void restore_pending_publication(RunImagePublication publication) {
+        host_.pending_publication_ = std::move(publication);
     }
     auto take_pending_publication() { return std::exchange(host_.pending_publication_, {}); }
     void clear_pending_publication() { host_.pending_publication_ = {}; }

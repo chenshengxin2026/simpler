@@ -76,8 +76,13 @@ PmuCollector::~PmuCollector() {
 
 int PmuCollector::init(
     int num_cores, int num_threads, const PmuAllocCallback &alloc_cb, PmuRegisterCallback register_cb,
-    const PmuFreeCallback &free_cb, int device_id
-) {
+    const PmuFreeCallback &free_cb, int device_id, PmuUnregisterCallback unregister_cb
+) try {
+    if (register_cb != nullptr && unregister_cb == nullptr) {
+        LOG_ERROR("Pmu collector registration requires an unregister callback");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+
     if (num_cores <= 0 || num_threads <= 0 || alloc_cb == nullptr || free_cb == nullptr) {
         LOG_ERROR("PmuCollector::init: invalid arguments");
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -102,7 +107,6 @@ int PmuCollector::init(
 
     num_cores_ = num_cores;
     num_threads_ = num_threads;
-    buffers_registered_ = (register_cb != nullptr);
 
     reset_collector_shards();
     execution_complete_.store(false, std::memory_order_release);
@@ -118,29 +122,18 @@ int PmuCollector::init(
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
-    // ---- Allocate shared header + buffer-state region ----
-    shm_size_ = calc_pmu_data_size(num_cores);
-    shm_dev_ = alloc_cb(shm_size_);
-    if (shm_dev_ == nullptr) {
-        LOG_ERROR("PmuCollector: failed to allocate PMU shared memory (%zu bytes)", shm_size_);
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
+    set_memory_context(alloc_cb, register_cb, free_cb, nullptr, nullptr, nullptr, nullptr, 0, device_id, unregister_cb);
+    profiling_common::InitRollbackGuard<decltype(manager_)> guard(
+        manager_, free_cb, register_cb != nullptr ? unregister_cb : nullptr, device_id
+    );
+    int allocation_rc = 0;
+    const size_t shm_size_local = calc_pmu_data_size(num_cores);
+    void *shm_host_local = nullptr;
+    void *shm_dev_local = alloc_paired_buffer(shm_size_local, &shm_host_local, &allocation_rc);
+    if (shm_dev_local == nullptr) return allocation_rc;
+    std::memset(shm_host_local, 0, shm_size_local);
 
-    if (register_cb != nullptr) {
-        int rc = register_cb(shm_dev_, shm_size_, device_id, &shm_host_);
-        if (rc != 0) {
-            LOG_ERROR("PmuCollector: halHostRegister for PMU SHM failed: %d", rc);
-            free_cb(shm_dev_);
-            shm_dev_ = nullptr;
-            return rc;
-        }
-        shm_registered_ = true;
-    } else {
-        shm_host_ = shm_dev_;
-    }
-    std::memset(shm_host_, 0, shm_size_);
-
-    PmuDataHeader *hdr = get_pmu_header(shm_host_);
+    PmuDataHeader *hdr = get_pmu_header(shm_host_local);
     hdr->event_type = static_cast<uint32_t>(event_type_);
     hdr->num_cores = static_cast<uint32_t>(num_cores);
 
@@ -148,28 +141,13 @@ int PmuCollector::init(
     const size_t buf_size = sizeof(PmuBuffer);
 
     for (int c = 0; c < num_cores; c++) {
-        PmuBufferState *state = pmu_state(c);
+        PmuBufferState *state = get_pmu_buffer_state(shm_host_local, c);
 
         for (int b = 0; b < PLATFORM_PMU_BUFFERS_PER_CORE; b++) {
-            void *dev_ptr = alloc_cb(buf_size);
-            if (dev_ptr == nullptr) {
-                LOG_ERROR("PmuCollector: failed to allocate PmuBuffer c=%d b=%d", c, b);
-                return PTO_RUNTIME_ERR_INTERNAL;
-            }
-
-            void *host_ptr = dev_ptr;
-            if (register_cb != nullptr) {
-                int rc = register_cb(dev_ptr, buf_size, device_id, &host_ptr);
-                if (rc != 0) {
-                    LOG_ERROR("PmuCollector: halHostRegister for PmuBuffer c=%d b=%d failed: %d", c, b, rc);
-                    free_cb(dev_ptr);
-                    return rc;
-                }
-            }
+            void *host_ptr = nullptr;
+            void *dev_ptr = alloc_paired_buffer(buf_size, &host_ptr, &allocation_rc);
+            if (dev_ptr == nullptr) return allocation_rc;
             std::memset(host_ptr, 0, buf_size);
-
-            // Track dev→host so the mgmt thread can resolve_host_ptr().
-            manager_.register_mapping(dev_ptr, host_ptr);
 
             if (b < PLATFORM_PMU_SLOT_COUNT) {
                 // First N buffers go directly into this core's free_queue.
@@ -192,21 +170,19 @@ int PmuCollector::init(
 
     rebuild_csv_header();
 
+    guard.commit();
+    shm_dev_ = shm_dev_local;
+    shm_size_ = shm_size_local;
+    publish_shared_memory(shm_dev_local, shm_host_local, shm_size_local);
     initialized_ = true;
-    // Hand the memory context to the base. start(tf) (inherited) will assemble
-    // a MemoryOps from these and launch mgmt + poll threads. PmuModule's alloc
-    // fallback in process_entry can then grow the buffer pool on demand if
-    // both the per-core free_queue and the recycled pool drain.
-    set_memory_context(
-        alloc_cb, register_cb, free_cb, /*copy_to=*/nullptr, /*copy_from=*/nullptr, shm_dev_, shm_host_, shm_size_,
-        device_id
-    );
 
     LOG_INFO(
         "PMU collector initialized: %d cores, %d threads, SHM=0x%lx, CSV=%s (opened on first record)", num_cores,
         num_threads, reinterpret_cast<unsigned long>(shm_dev_), csv_path_.c_str()
     );
     return 0;
+} catch (const std::bad_alloc &) {
+    return PTO_RUNTIME_ERR_INTERNAL;
 }
 
 void PmuCollector::start(const profiling_common::ThreadFactory &thread_factory) {
@@ -659,8 +635,10 @@ void PmuCollector::finalize(PmuUnregisterCallback unregister_cb, const PmuFreeCa
     // Release per-buffer mappings tracked by the framework. PMU registered
     // each PmuBuffer individually at init time (when register_cb was set), so
     // unregister each one here before freeing.
+    if (!validate_release_callbacks(unregister_cb, free_cb)) return;
+
     auto release_buf = [&](void *p) {
-        release_one_buffer(p, buffers_registered_ ? unregister_cb : nullptr, free_cb);
+        release_one_buffer(p, unregister_cb, free_cb);
     };
     manager_.release_owned_buffers(release_buf);
 
@@ -688,14 +666,10 @@ void PmuCollector::finalize(PmuUnregisterCallback unregister_cb, const PmuFreeCa
             state->free_queue.head = tail;
         }
     }
+    release_buf(shm_dev_);
+    shm_dev_ = nullptr;
+    shm_host_ = nullptr;
     manager_.clear_mappings();
-
-    // Free shared header region via the shared RAII helper.
-    if (shm_dev_ != nullptr) {
-        release_one_buffer(shm_dev_, shm_registered_ ? unregister_cb : nullptr, free_cb);
-        shm_dev_ = nullptr;
-        shm_host_ = nullptr;
-    }
 
     initialized_ = false;
     (void)close_csv_shards();

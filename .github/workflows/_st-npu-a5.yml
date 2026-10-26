@@ -74,7 +74,7 @@ jobs:
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           .venv/bin/python -m simpler_setup.tools.scene_test_compile examples tests/st \
-            --platform a5 --exclude-level 4 --require-pto-isa --compile-workers 8 -q \
+            --platform a5 --exclude-level 4 --require-pto-isa --compile-workers 32 -q \
             --manual "$MANUAL_MODE"
 
       - name: Compile Qwen standalone kernels (a5)
@@ -94,7 +94,7 @@ jobs:
           test -n "$runtimes"
           for runtime in $runtimes; do
             .venv/bin/python "examples/a5/$runtime/qwen3_14b_decode/main.py" \
-              --platform a5 --compile-only --compile-workers 8
+              --platform a5 --compile-only --compile-workers 32
           done
 
       - name: Run pytest scene tests (a5)

@@ -302,20 +302,31 @@ Layer 1  Level axis
 │   against the --device pool. Two job kinds share this phase:
 │     - L3 SceneTestCase classes (one job per class)
 │     - Standalone pytest functions marked with @pytest.mark.device_count
-│       + @pytest.mark.runtime (one job per function)
+│       (one job per function). @pytest.mark.runtime is optional: a
+│       runtime-agnostic function gets the same devices and the same
+│       isolation, and its child is narrowed by nodeid alone.
 │   CANN isolation is automatic (each job is its own process). Cross-runtime
 │   jobs can overlap when their devices don't.
 │
-└─ L2 phase (runs after Resource drains)
-    │
-    ├─ Layer 2  Runtime — serial subprocess per runtime (CANN isolation)
-    │   └─ Layer 3  Device — parallel subprocess per device (xdist for pytest,
-    │               custom fanout for standalone). Capacity bounded by --device size
-    │       └─ Layer 4  Class — one ChipWorker per (runtime, device), reused
-    │                   across every class assigned to that device
-    │           └─ Layer 5  Case — serial within a class
-    │               └─ Layer 6  Rounds — `--rounds N` loop, reuses Worker;
-    │                           L2 child memory is declared per tensor, independent of N
+├─ L2 phase (runs after Resource drains)
+│   │
+│   ├─ Layer 2  Runtime — serial subprocess per runtime (CANN isolation)
+│   │   └─ Layer 3  Device — parallel subprocess per device (xdist for pytest,
+│   │               custom fanout for standalone). Capacity bounded by --device size
+│   │       └─ Layer 4  Class — one ChipWorker per (runtime, device), reused
+│   │                   across every class assigned to that device
+│   │           └─ Layer 5  Case — serial within a class
+│   │               └─ Layer 6  Rounds — `--rounds N` loop, reuses Worker;
+│   │                           L2 child memory is declared per tensor, independent of N
+│
+└─ Leftover phase (runs last, in the dispatching process)
+    Every selected item the first two phases do not claim — a plain
+    `requires_hardware` function, say, which matches neither a device_count
+    marker nor a SceneTestCase runtime. Running them here is what keeps
+    "selected" and "run" the same set: an item no phase claims used to be
+    reported in neither the passed nor the skipped count. A test that needs
+    a process of its own declares `@pytest.mark.device_count` and becomes a
+    Resource job instead.
 ```
 
 ### Quick examples
@@ -576,8 +587,12 @@ cmake --build tests/ut/cpp/build --parallel 4
 python tests/lint/check_ut_cpp_axis.py
 ```
 
-CI runs it in the `ut` job, right after ctest. It is not a pre-commit hook —
-it reads a configured build, which pre-commit does not have.
+CI runs it in the `ut` job, right after ctest, on the Linux leg only — the
+answer is a property of the include paths the CMakeLists compose rather than of
+the host, and the Linux build graph is the superset (a non-Linux configure drops
+`test_thread_scheduling.cpp`, whose wrapped `sched_*` symbols are a GNU ld
+feature). It is not a pre-commit hook — it reads a configured build, which
+pre-commit does not have.
 
 #### Where the stand-ins come from
 
@@ -694,6 +709,16 @@ CTest passes allocated device ids via environment variables:
 Tests read these to determine which devices to use. See `test_comm_lifecycle.cpp::read_ctest_devices()` for the parsing pattern.
 
 ### New Scene Test
+
+An L3 scene that qualifies default automatic admission declares
+`@scene_test(level=3, runtime=..., automatic_admission=True)`. Both pytest and
+standalone factories then omit `pipeline_depth`, `launch_depth`,
+`pending_run_depth`, and `workspace_budget_bytes`; supplying any of them in its
+case config is an error, including `None` or zero. Existing scenes retain their
+explicit launch-depth policy. Each automatic class gets a fresh standalone
+Worker so cold-start assertions cannot inherit another class's capacity.
+This is scene metadata, not a Worker configuration option. Assert the actual
+Worker mode and use endpoint capacity/identity evidence in the scene.
 
 Create a `test_*.py` file using the `@scene_test` decorator:
 
@@ -893,7 +918,7 @@ When running `pytest --platform a2a3 --device 8-11`, the dispatcher does this:
 
 ### Resource phase — device bin-packing
 
-For every collected resource job (L3 ``SceneTestCase`` classes and standalone pytest functions marked with ``@pytest.mark.device_count`` + ``@pytest.mark.runtime``), the scheduler (`simpler_setup/parallel_scheduler.py`) maintains a free-device set starting at `[8, 9, 10, 11]`. It pops the next queued job and, if the free set can cover its `device_count`, grabs that many ids and spawns:
+For every collected resource job (L3 ``SceneTestCase`` classes and standalone pytest functions marked with ``@pytest.mark.device_count``), the scheduler (`simpler_setup/parallel_scheduler.py`) maintains a free-device set starting at `[8, 9, 10, 11]`. It pops the next queued job and, if the free set can cover its `device_count`, grabs that many ids and spawns:
 
 ```text
 # L3 class job

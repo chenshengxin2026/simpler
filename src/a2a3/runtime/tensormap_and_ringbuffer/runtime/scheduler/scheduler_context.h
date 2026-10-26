@@ -21,14 +21,10 @@
 #include "aicore_completion_mailbox.h"
 #include "dispatch_payload.h"
 
-// These macros are defined in runtime.h, but we cannot include it here
-// (it pulls in Handshake which we only forward-declare).  Mirror the
-// authoritative values so the class layout compiles standalone.
+// runtime.h pulls in Handshake, which this header only forward-declares.
+// RUNTIME_MAX_WORKER derives from the same platform core count in both headers.
 #ifndef RUNTIME_MAX_WORKER
 #define RUNTIME_MAX_WORKER PLATFORM_MAX_CORES
-#endif
-#ifndef RUNTIME_MAX_FUNC_ID
-#define RUNTIME_MAX_FUNC_ID 1024
 #endif
 
 // Forward declarations — avoid pulling in full headers for pointer/reference params.
@@ -79,7 +75,7 @@ public:
     // Barrier-free counterpart of assign_cores_to_threads: thread tidx populates
     // its own CoreTracker + per-core payload state for the clusters it owns, right
     // after handshaking them — no all-thread barrier or leader post_handshake_init.
-    void assign_own_clusters(int32_t tidx);
+    void assign_own_clusters(Runtime *runtime, int32_t tidx);
     // Latch completion + shutdown cores on a handshake failure seen without the
     // barrier (non-DFX path). Idempotent.
     void abort_and_shutdown(Runtime *runtime);
@@ -137,6 +133,7 @@ public:
     bool orchestration_done() const { return orchestrator_done_.load(std::memory_order_relaxed); }
 
 private:
+    friend class SchedulerContextTestPeer;
     // =========================================================================
     // State
     // =========================================================================
@@ -192,10 +189,13 @@ private:
     std::atomic<bool> orchestrator_done_{false};
     std::atomic<bool> completed_{false};
     std::atomic<bool> fatal_shutdown_started_{false};
-    // Per-core retirement claim. The winner owns that core's register window
-    // and return gate for the rest of the run; every other path leaves both
-    // alone. Indexed by core id, reset in pre_handshake_init.
-    std::atomic<bool> core_retired_[PLATFORM_MAX_CORES];
+    // READY publishes completed initialization, or an opened window on startup
+    // failure. REQUESTED retains an exit request before that publication. Only
+    // the operation adding the second bit owns the core's window and return gate.
+    // Indexed by core id and reset before handshake in each generation.
+    static constexpr uint8_t RETIREMENT_READY = 1;
+    static constexpr uint8_t RETIREMENT_REQUESTED = 2;
+    uint8_t retirement_state_[PLATFORM_MAX_CORES]{};
     // The active callable's registration-owned object-address table and the
     // number of entries it holds, both bound from the descriptor in the cold
     // path. The table is in the callable's registration block, not in the
@@ -247,9 +247,13 @@ private:
     // exit to every handshake'd core. Idempotent.
     bool begin_emergency_shutdown();
     void signal_emergency_shutdown(Runtime *runtime);
-    // Claim and retire the named cores. Cores already claimed elsewhere are
-    // skipped, so callers may name overlapping sets.
+    // Request the named cores; an unpublished core is retired by its publisher.
+    // The second-bit winner alone reads execution state and manages the window.
     int32_t retire_cores(Runtime *runtime, const int32_t *core_ids, int32_t core_num);
+    void publish_retirement_cores(Runtime *runtime, const int32_t *core_ids, int32_t core_num);
+    void publish_all_retirement_cores(Runtime *runtime);
+    void publish_retirement_group(Runtime *runtime, int32_t owner_thread);
+    int32_t retire_claimed_cores(Runtime *runtime, const int32_t *core_ids, int32_t core_num);
     int32_t retire_all_cores(Runtime *runtime);
     void emergency_shutdown(Runtime *runtime);
 
@@ -505,13 +509,15 @@ private:
     __attribute__((noinline, cold)) LoopAction
     check_idle_fatal_error(int32_t thread_idx, SharedMemoryHeader *header, Runtime *runtime);
 
-    __attribute__((noinline, cold)) void log_stall_diagnostics(
-        int32_t thread_idx, int32_t task_count, int32_t idle_iterations, int32_t last_progress_count,
-        StallDumpReport report
-    );
+    __attribute__((noinline, cold)) void
+    log_stall_diagnostics(int32_t thread_idx, int32_t idle_iterations, StallDumpReport report);
+
+    __attribute__((noinline, cold)) void
+    log_global_stall_diagnostics(int32_t trigger_thread_idx, int32_t idle_iterations, int32_t last_progress_count);
 
     __attribute__((noinline, cold)) void log_shutdown_stall_snapshot(
-        int32_t trigger_thread_idx, int32_t trigger_idle_iterations, int32_t trigger_last_progress_count
+        int32_t trigger_thread_idx, int32_t trigger_idle_iterations, int32_t trigger_last_progress_count,
+        const char *reason
     );
 
     // Reverse lookup: given a global core_id, find which scheduler thread's
@@ -550,7 +556,7 @@ private:
         int32_t stuck_core;    // S1: core hosting it (-1 if none)
     };
 
-    // Scan the rings once (same ground truth as log_stall_diagnostics: a slot is
+    // Scan the rings once (same ground truth as log_global_stall_diagnostics: a slot is
     // RUNNING iff a core holds it as running_slot_state) and reduce to a
     // StallClassification. Pure reads — safe to call from any scheduler thread.
     __attribute__((noinline, cold)) StallClassification classify_stall_reason() const;

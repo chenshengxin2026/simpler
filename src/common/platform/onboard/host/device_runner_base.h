@@ -81,13 +81,19 @@
 #include "host/kernel_entry_validation.h"
 #include "host/kernel_execution_state.h"
 #include "host/memory_allocator.h"
+#include "host/auto_admission.h"
+#include "host/run_resource_growth.h"
 #include "host/workspace_manager.h"
 #include "host/pmu_collector.h"
 #include "host/queued_stream_waits.h"
 #include "host/queued_wait_discharge.h"
 #include "host/run_boundary_marks.h"
 #include "host/run_evidence_retention.h"
+#include "host/run_progress_slots.h"
+#include "host/run_resource_slots.h"
+#include "host/run_stream_pair.h"
 #include "host/run_completion_fence.h"
+#include "host/run_caller_order.h"
 #include "host/teardown_recorder.h"
 #include "host/run_outcome_decision.h"
 #include "host/runtime_timeout_config.h"
@@ -309,6 +315,10 @@ public:
      */
     ExecutionModeLatch &execution_mode_latch() { return execution_mode_latch_; }
 
+    /** True only after simpler_init succeeds and before teardown begins. */
+    bool program_initialized() const { return program_initialized_; }
+    void set_program_initialized(bool initialized) { program_initialized_ = initialized; }
+
     /** Context-lifetime streams and events, live only in kernel mode. */
     KernelExecutionState &kernel_execution_state() { return kernel_exec_state_; }
 
@@ -316,9 +326,10 @@ public:
      * Whether any kernel-context owner still holds a device resource: the
      * streams and events in `KernelExecutionState`, the argument blocks in
      * `PersistentKernelArgs`, the loaded AICPU binary in `LoadAicpuOp`, or a
-     * retained callable image in `chip_callable_buffers_`. The destruction
-     * guard reads this aggregate, so a close that succeeded for some owners and
-     * failed for another is not a close.
+     * retained callable image in `chip_callable_buffers_`. An adopted device
+     * also retains the context until shared native-run resources have closed.
+     * The destruction guard reads this aggregate: a close that succeeded for
+     * some owners and failed for another is not a close.
      *
      * False on a program context: `chip_callable_buffers_` and the loader are
      * shared with program registration, and a program context resets its
@@ -327,7 +338,10 @@ public:
      */
     bool kernel_resources_live() const {
         if (!execution_mode_latch_.is_kernel()) return false;
-        return kernel_exec_state_.has_live_resources() || persistent_args_.has_live_resources() ||
+        // Only successful resource teardown clears the adopted device. This
+        // also covers a failed release of native-run events or streams after
+        // the cold-path owners below have already closed successfully.
+        return device_id_ >= 0 || kernel_exec_state_.has_live_resources() || persistent_args_.has_live_resources() ||
                load_aicpu_op_.has_live_resources() || !chip_callable_buffers_.empty();
     }
 
@@ -346,8 +360,14 @@ public:
     bool retains_failed_callable_release() const { return execution_mode_latch_.is_kernel(); }
 
     // Program attaches its owned device; kernel verifies the caller's current
-    // device without changing it. Also used for abandoning an unlaunched run.
+    // device and RTS context without changing them. Also used for abandoning
+    // an unlaunched run.
     int enter_run_thread();
+    int validate_caller_stream(rtStream_t caller);
+    // A borrowed environment must be current before resource mutation. An
+    // owned environment has no caller binding to validate; enter_run_thread
+    // performs its thread attachment before device work.
+    int validate_current_context() const;
     int init_kernel_context(int device_id);
     int prepare_kernel_callable(int32_t callable_id);
 
@@ -385,6 +405,33 @@ public:
     }
 
     /**
+     * Raise only the swimlane collector's retained-run capacity.
+     *
+     * The other five keep `dfx::runs::kMaxOpenEpochs`: their limits and their
+     * fixed-budget formulas are approved at that figure, and nothing here has
+     * examined what a third unpublished run would mean for any of them. The
+     * collector itself decides whether the change is admissible and leaves
+     * itself untouched when it is not.
+     */
+    bool set_retained_epoch_limit(size_t limit) { return chip_swimlane_collector_.set_retained_epoch_limit(limit); }
+
+    /**
+     * Size every per-run resource to the count of run-resource sets this
+     * context was granted.
+     *
+     * The grant is the worker's, not this module's: the module declares what it
+     * supports, and the worker decides how much of that this context uses. So
+     * it arrives here once, before any run can name a set, and every per-set
+     * resource is built to it in one step. Refused once a set is in service,
+     * and refused for a count this runner cannot reach, so a caller never gets
+     * a grant it would then index past.
+     */
+    bool set_run_resource_grant(size_t granted);
+
+    /** How many run-resource sets this runner currently holds. */
+    size_t run_resource_grant() const { return granted_run_resource_sets_; }
+
+    /**
      * Publish every run closed up to now, then report.
      *
      * Returns 0 when each promised file exists; a published partial counts as
@@ -398,6 +445,7 @@ public:
 
     void free_tensor(void *dev_ptr);
     int copy_to_device(void *dev_ptr, const void *host_ptr, std::size_t bytes);
+    int stage_launch_metadata(uint32_t pipeline_slot, const HostMetadataRegion *regions, size_t count);
     int copy_from_device(void *host_ptr, const void *dev_ptr, std::size_t bytes);
 
     /**
@@ -499,6 +547,21 @@ public:
     int acquire_scheduler_state_storage(
         uint32_t pipeline_slot, std::size_t bytes, std::size_t alignment, void **device_out, void **host_out
     );
+    std::shared_ptr<void> get_orchestration_scratch(uint32_t slot) const {
+        return slot < orchestration_scratch_.size() ? orchestration_scratch_[slot] : std::shared_ptr<void>{};
+    }
+    void set_orchestration_scratch(uint32_t slot, std::shared_ptr<void> scratch) {
+        if (slot < orchestration_scratch_.size()) orchestration_scratch_[slot] = std::move(scratch);
+    }
+    std::shared_ptr<void> get_prepare_plan(uint32_t slot) const {
+        return slot < prepare_plans_.size() ? prepare_plans_[slot] : std::shared_ptr<void>{};
+    }
+    void set_prepare_plan(uint32_t slot, uint64_t epoch, std::shared_ptr<void> plan) {
+        if (!auto_admission_.enabled() || slot >= prepare_plans_.size()) return;
+        auto_admission_.begin_plan(slot, epoch, AutoAdmissionState::Phase::Planned);
+        auto_admission_.note_plan_stamped(slot);
+        prepare_plans_[slot] = std::move(plan);
+    }
     int acquire_sm_mirror(uint32_t pipeline_slot, std::size_t bytes, std::size_t alignment, void **addr_out);
     /**
      * Retain the host buffer a run assembles its device execution image in.
@@ -585,6 +648,109 @@ public:
     bool workspace_enabled() const { return workspace_.enabled(); }
 
     /**
+     * Let this context size its own concurrency from the resources it proves.
+     *
+     * Requested once, before anything is prepared, by a context whose caller
+     * configured no depth and no budget. An explicitly configured context, a
+     * borrowed one and a simulated one never ask, and every admission figure
+     * below then reports what it reported before.
+     */
+    void enable_automatic_admission() { auto_admission_.configure(granted_run_resource_sets_); }
+
+    bool automatic_admission_enabled() const { return auto_admission_.enabled(); }
+
+    /**
+     * Run-resource sets this context can report it is able to hold.
+     *
+     * The proven prefix plus one exploratory set while no growth is in flight,
+     * capped by the identity directory the caller sized. One until a run has
+     * completed its resource commit, so nothing is admitted on the strength of
+     * a slot that has demonstrated nothing.
+     */
+    uint32_t admissible_run_resource_sets() const {
+        if (!auto_admission_.enabled()) return static_cast<uint32_t>(granted_run_resource_sets_);
+        return auto_admission_.affordable_sets(static_cast<uint32_t>(granted_run_resource_sets_));
+    }
+
+    /**
+     * Give up every resource a saved plan still holds, at whatever stage it
+     * reached, and forget it.
+     *
+     * The one path every abandonment uses — a caller's, a close, a poison —
+     * because a plan that waited owns things an unprepared run does not: its
+     * input staging reference, its growth permission, and whatever its
+     * in-flight transaction had staged. Refuses rather than guessing when the
+     * run could still have reached the device, since releasing a borrow then
+     * would hand back pages device work may still name.
+     *
+     * Idempotent: a second call for a slot whose plan is gone, or for an epoch
+     * that no longer owns it, reports success and does nothing.
+     *
+     * @return 0 when the slot holds no plan for this epoch afterwards
+     */
+    // Called only after native reservation proves exclusive ownership of slot.
+    void adopt_run_plan_attempt(uint32_t pipeline_slot, std::uint64_t run_epoch) {
+        auto_admission_.adopt_plan_attempt(pipeline_slot, run_epoch);
+    }
+    int abort_run_plan(uint32_t pipeline_slot, std::uint64_t run_epoch);
+
+    /**
+     * Give back what one prepare attempt took under its own identity, keeping
+     * the slot's saved plan for the attempt that continues it.
+     *
+     * The wait path's counterpart to `abort_run_plan`: a retry takes its own
+     * claims and its own input-staging reference under its own identity, so the
+     * attempt that stood down must hand its back. The plan, the wait set it
+     * captured and the growth permission it holds all stay.
+     */
+    void release_plan_epoch_refs(uint32_t pipeline_slot, std::uint64_t run_epoch);
+
+    /** Withdraw a slot's resource proof. */
+    void clear_run_resource_proof(uint32_t pipeline_slot) { auto_admission_.clear_proven(pipeline_slot); }
+
+    /**
+     * Return the storage of every run-resource set nothing can reach, so a
+     * refused growth can ask again against what they held.
+     *
+     * The step between a refusal and its one retry. `reclaim_obsolete` alone
+     * releases only generations a region has *replaced*, and deliberately keeps
+     * a set's idle current backing so the next same-sized run reuses it — so
+     * without this a request fails beside storage it could have had: a set
+     * cached by an earlier run, with no consumer left, that no reclamation will
+     * ever offer.
+     *
+     * The decision is `RunResourceGrowth::trim_idle_sets`, which this reaches
+     * through `RunResourceEndpointView`; what this adds is the runner's own
+     * state — which slots and banks live runs hold, where each slot's staging
+     * is, and what each bank's regions are.
+     *
+     * @return sets whose storage was detached
+     */
+    std::size_t trim_idle_run_resources(uint32_t requesting_slot);
+
+    /**
+     * One growth attempt, then the trim and the reclaim, then exactly one more.
+     *
+     * `attempt` is the caller's own allocation — a staging acquire or a whole
+     * bank's staged transaction — reported as served, refused, or refused by a
+     * degraded ledger. `rollback_before_retry` is for an attempt that stages
+     * storage it must hand back before the trim can see it.
+     */
+    GrowthAttempt grow_with_one_retry(
+        uint32_t requesting_slot, bool rollback_before_retry, GrowthAttempt (*attempt)(void *ctx), void *ctx
+    );
+
+    /**
+     * Record that a run on this slot completed its resource commit.
+     *
+     * The slot becomes an admission target and the context's growth permission
+     * goes back. Called on the success path only, and the plan's own saved
+     * state ends with it: from here the run owns its resources as a prepared
+     * run, not as a plan that might still resume.
+     */
+    void note_run_resources_proven(uint32_t pipeline_slot, std::uint64_t run_epoch);
+
+    /**
      * Report one run fact at the boundary that produced it.
      *
      * Called from the run phase entries, never derived from a phase word or
@@ -615,6 +781,12 @@ public:
      * shared-memory region is published at.
      */
     static void set_workspace_plan_region(const WorkspaceManager::RegionKey &region) noexcept;
+
+    /** Publish what the named region is published at right now. */
+    static void set_workspace_plan_region_backing(void *backing) noexcept;
+
+    /** Raw backing of one region of one arena bank, or null while uncommitted. */
+    void *arena_region_backing(uint32_t bank_id, std::size_t region_index) const;
     static WorkspaceManager::RegionKey workspace_plan_region() noexcept;
 
     /** Scopes one thread's workspace plan identity to a prepare. */
@@ -799,7 +971,7 @@ public:
      * One-shot device initialization. Performs, in order:
      *   1. attach_current_thread on device_id_
      *   2. rtStreamCreate for AICPU + AICore streams (persistent, freed
-     *      by the subclass `finalize()`).
+     *      by the subclass `finalize_impl()`).
      *   3. Bootstrap the dispatcher + register the inner AICPU SO via
      *      `ensure_binaries_loaded()`.
      *   4. Provision the requested async-DMA workspaces via
@@ -915,7 +1087,7 @@ public:
      * Called by finalize on every path that ends a run, emitted or not: a run
      * that never launched still owns its slot. Re-arming a slot that is still
      * armed means a successor took storage whose result nobody read, and
-     * `arm_device_wall_buffer` reports that rather than overwriting it.
+     * preparation refuses timing for that slot rather than overwriting it.
      */
     void release_device_run_timing(uint32_t pipeline_slot);
 
@@ -1175,6 +1347,14 @@ public:
     bool has_callable(int32_t callable_id) const;
 
     /**
+     * Serializes the registration, unregistration and finalize entry points,
+     * so an auto-ID scan and the ID it claims are one atomic step with respect
+     * to explicit-ID registration and unregistration. Runs, initialization and
+     * destroy are still caller-serialized.
+     */
+    std::mutex &callable_registration_mutex() { return callable_registration_mu_; }
+
+    /**
      * Content-derived stable identity for a registered callable: the
      * ELF Build-ID 64-bit hash of its orchestration SO (CallableState::hash,
      * computed at record_device_orch_callable time via elf_build_id_64). Returns 0 when
@@ -1337,6 +1517,12 @@ public:
     virtual int provision_native_run_resources(uint32_t /*pipeline_slot*/) { return 0; }
     virtual int abandon_native_run_resources(uint32_t /*pipeline_slot*/) { return 0; }
 
+    struct RunStreams {
+        rtStream_t aicpu{nullptr};
+        rtStream_t aicore{nullptr};
+        bool ready() const { return aicpu != nullptr && aicore != nullptr; }
+    };
+
     struct PreparedExecution {
         PreparedExecution(
             const NativeRunIdentity &identity_in, Runtime &runtime_in, const CallConfig &config_in,
@@ -1358,6 +1544,9 @@ public:
             num_aicore(other.num_aicore),
             launch_aicpu_num(other.launch_aicpu_num),
             kernel_args(std::move(other.kernel_args)),
+            streams(std::exchange(other.streams, RunStreams{})),
+            artifact_identity(other.artifact_identity),
+            caller_stream(std::exchange(other.caller_stream, nullptr)),
             resources_owned(std::exchange(other.resources_owned, false)),
             aicore_retirement_attempted(std::exchange(other.aicore_retirement_attempted, false)),
             joinable_boundary(other.joinable_boundary),
@@ -1379,10 +1568,25 @@ public:
          * teardown and no other run's.
          */
         DfxRunConfig dfx{};
-        uint32_t pipeline_slot{PTO_PIPELINE_MAX_DEPTH};
+        uint32_t pipeline_slot{UINT32_MAX};
         int num_aicore{0};
         int launch_aicpu_num{0};
         KernelArgsHelper kernel_args{};
+        // Bound before publication under the execution claim, unchanged through
+        // retirement. Handles are borrowed: A2/A3's pair retains submitted owners;
+        // A5's runner owns its streams until all runs retire. Neither preparation
+        // nor moving this state transfers ownership of the streams themselves.
+        RunStreams streams{};
+        /**
+         * This run's whole published identity, copied from its descriptor.
+         *
+         * `identity` above is what later phase calls address the run by and has
+         * no field for `run_id`; a diagnostic artifact needs that plus the
+         * submitting Worker's provenance to be attributed to its submission. An
+         * all-zero `owner_instance_id` means the caller stated none.
+         */
+        NativeRunArtifactIdentity artifact_identity{};
+        rtStream_t caller_stream{nullptr};
         bool resources_owned{false};
         bool aicore_retirement_attempted{false};
         /**
@@ -1406,8 +1610,11 @@ public:
         NativeRunJoin join{};
     };
 
+    // Reads host-owned run/registration state before device recovery or cleanup.
+    void log_run_failure(const PreparedExecution &prepared, int rc) const;
+
     struct ActiveExecution {
-        explicit ActiveExecution(std::unique_ptr<PreparedExecution> prepared_in, LaunchProgress progress_in) :
+        explicit ActiveExecution(std::unique_ptr<PreparedExecution> prepared_in, LaunchProgress progress_in) noexcept :
             prepared(std::move(prepared_in)),
             progress(progress_in) {}
         ActiveExecution(const ActiveExecution &) = delete;
@@ -1418,6 +1625,31 @@ public:
         std::unique_ptr<PreparedExecution> prepared;
         LaunchProgress progress{LaunchProgress::NotStarted};
     };
+
+    /**
+     * Whether `succ` may be ordered behind `pred` while both collect swimlane
+     * diagnostics.
+     *
+     * Read-only in the strongest sense this class can offer: it arms nothing,
+     * latches no shape, starts no thread, reserves no bucket and issues no
+     * device call. It is asked before `arm_collectors_for_run`, which is the
+     * first thing that could rebuild a collector, so a stale shape here is a
+     * decline rather than a rebuild under a predecessor that is still
+     * producing.
+     *
+     * A true answer is not a reservation. The bucket it saw free is claimed
+     * later by `run_begin`, which rechecks capacity and fatality under the
+     * collector's own mutex; between the two only the lane can claim, and the
+     * lane is the single thread asking.
+     *
+     * Both arguments are the configuration owners for their runs: the
+     * successor's own prepared execution, and the predecessor's active
+     * execution's prepared state. Neither this runner's resident DFX members
+     * nor either run's original `CallConfig` substitutes, because a resident
+     * member describes whichever run armed last and a `CallConfig` has not been
+     * through the per-run degradation a channel may have applied.
+     */
+    bool can_join_diagnostic_run(const PreparedExecution &succ, const PreparedExecution &pred) const;
 
     struct LaunchOutcome {
         int rc{-1};
@@ -1436,7 +1668,12 @@ public:
         Runtime &runtime, const CallConfig &config, uint32_t pipeline_slot, const NativeRunIdentity &identity,
         std::unique_ptr<PreparedExecution> *prepared
     ) = 0;
-    virtual LaunchOutcome launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) = 0;
+    /**
+     * Allocate the active owner before entering the backend. An escaping backend
+     * exception returns Partial with that same prepared state still owned; only
+     * an explicit NotStarted result returns it for rollback.
+     */
+    LaunchOutcome launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) noexcept;
     virtual void abandon_prepared_execution(PreparedExecution &prepared) noexcept = 0;
 
     /**
@@ -1456,13 +1693,10 @@ public:
     virtual DrainOutcome drain_execution(ActiveExecution &active) = 0;
 
     /**
-     * Cleanup all resources. Each arch's `finalize()` wraps
-     * `finalize_common()` with arch-specific device-reset behaviour:
-     * a2a3 has the ACL-ready branch + dep_gen collector teardown;
-     * a5 does straight `rtDeviceReset`. See the subclass docs for the
-     * per-arch contract.
+     * Validate the execution environment before architecture-specific cleanup.
+     * The public entry is non-virtual; subclasses implement finalize_impl().
      */
-    virtual int finalize() = 0;
+    int finalize();
 
     virtual int fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) = 0;
 
@@ -1632,6 +1866,15 @@ public:
      */
     void publish_host_phase_run_to_collector(uint32_t pipeline_slot) noexcept;
     /**
+     * This slot's own host-orchestration state, for a run that must not read
+     * the collector's single resident copy.
+     */
+    bool host_orchestrated_for_slot(uint32_t pipeline_slot) const noexcept {
+        if (pipeline_slot >= host_phase_runs_.size()) return false;
+        return host_phase_runs_[pipeline_slot].host_orchestrated;
+    }
+
+    /**
      * Write this pass's per-event host phase records under `output_prefix`.
      *
      * Host-only: every phase recorded is produced on the host during bind and the
@@ -1659,11 +1902,15 @@ public:
     const std::string &output_prefix() const { return output_prefix_; }
 
 protected:
+    virtual LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) = 0;
+
     // Ctor is protected: this class is for inheritance only — direct
     // instantiation (`new DeviceRunnerBase()`) is a compile error. The
     // public virtual dtor above lets the shared c_api delete through a
     // base pointer safely.
     DeviceRunnerBase();
+
+    virtual int finalize_impl() = 0;
 
     /**
      * `DeviceArena` callback trampolines bridging from C-style
@@ -1698,6 +1945,15 @@ protected:
     };
 
     /**
+     * This runner's answers to the questions a growth under pressure asks.
+     *
+     * Defined in the implementation: it holds only lookups into members this
+     * class already owns, and the policy built on them belongs to
+     * `RunResourceGrowth`, which is reachable without the device SDK.
+     */
+    class RunResourceEndpointView;
+
+    /**
      * Record that a bank region has given up the block at `base`.
      *
      * A managed block outlives the arena that was using it, so the arena's own
@@ -1723,6 +1979,25 @@ protected:
      *         recorded — refused rather than silently unprotected
      */
     int reference_bank_arenas(uint32_t arena_bank, const ArenaRegionRequest *requests, std::size_t count);
+
+    /** Record one acquisition the transaction in flight on this thread caused. */
+    void record_workspace_claim(void *base, bool was_region_backing);
+    /** Give back every reference this thread's abandoned transaction took. */
+    void rollback_workspace_claims();
+    /** Adopt this thread's claims as the regions' live references. */
+    void commit_workspace_claims();
+    /** Whether a waiting plan may not yet try again. */
+    bool growth_still_blocked(uint32_t pipeline_slot, AutoAdmissionState::Phase phase);
+    /** Take the context's growth permission, or report that a plan must wait. */
+    int claim_growth_permission(uint32_t pipeline_slot, std::uint64_t run_epoch, AutoAdmissionState::Phase phase);
+    /** Turn a refused growth into a bounded wait on named consumers, or a failure. */
+    int report_growth_refusal(
+        uint32_t pipeline_slot, AutoAdmissionState::Phase phase, std::size_t shortfall, GrowthAttempt outcome
+    );
+    /** Whether any run holding the native execution claim is this epoch. */
+    bool native_run_is_live(std::uint64_t run_epoch) const;
+    /** Withdraw a slot's saved graph plan without freeing its storage. */
+    void invalidate_graph_definition_staging(uint32_t pipeline_slot);
 
     /**
      * Configure STARS op execution timeout (once per DeviceRunner lifetime).
@@ -1823,12 +2098,11 @@ protected:
     /**
      * Prepare the device-phase/task-timing buffer for one run, in that run's
      * pipeline slot. Capture-disabled runs publish a null device base.
-     * Capture-enabled runs allocate the slot's buffer lazily, reset every
-     * record, and publish the base for AICPU stamping. Allocation or reset
-     * failure is non-fatal; the base stays null and timing reads as 0.
+     * Enabled runs allocate lazily and snapshot a full reset into pending
+     * launch metadata. Publication queues the reset before either kernel;
+     * its failure rejects launch. Allocation failure disables timing only.
      */
-    void ensure_device_wall_buffer(uint32_t pipeline_slot, KernelArgsHelper &kernel_args);
-    int arm_device_wall_buffer(uint32_t pipeline_slot, KernelArgsHelper &kernel_args);
+    int ensure_device_wall_buffer(uint32_t pipeline_slot, KernelArgsHelper &kernel_args);
 
     /**
      * Point this run's KernelArgs at its slot's result region and stamp the run
@@ -1855,7 +2129,7 @@ protected:
      * reports no retained snapshot, and the existing reconcile remains the
      * authoritative accounting either way.
      */
-    uint64_t arm_chip_swimlane_run_terminal_bank(uint32_t pipeline_slot, uint64_t run_epoch);
+    uint64_t arm_chip_swimlane_run_terminal_bank(uint64_t run_epoch);
 
     /**
      * Resolve this run's block_dim: every cluster the device has, i.e.
@@ -1902,13 +2176,16 @@ protected:
      * still submitted nothing and can roll back.
      */
     int arm_run_fence(const PreparedExecution &prepared);
+    int queue_run_entry(PreparedExecution &prepared, LaunchProgressSink &sink);
+    int queue_caller_exit(const PreparedExecution &prepared);
+    RunStreams borrowed_run_streams() const;
 
     /**
      * Record one stream's completion boundary, immediately after that stream's
      * kernel submission was accepted. Notes the submission first, so a record
      * failure cannot be mistaken for a kernel that never launched.
      */
-    int record_run_boundary(const PreparedExecution &prepared, RunCompletionFence::StreamRole role, rtStream_t stream);
+    int record_run_boundary(const PreparedExecution &prepared, RunCompletionFence::StreamRole role);
 
     /**
      * Query this run's boundaries without waiting, as one of the
@@ -1924,7 +2201,7 @@ protected:
      * report about a stream left in error. That check is not a device-exception
      * detector; see `wait_run_fence`.
      */
-    int poll_run_fence(const PreparedExecution &prepared, rtStream_t aicpu_stream, rtStream_t aicore_stream);
+    int poll_run_fence(const PreparedExecution &prepared);
 
     /**
      * Establish that this run finished and what the device made of it.
@@ -1942,7 +2219,7 @@ protected:
      * in the definition. So the branch a successful run takes touches neither
      * stream of the pair, which is what lets a successor stay queued behind it.
      */
-    int wait_run_fence(const PreparedExecution &prepared, rtStream_t aicpu_stream, rtStream_t aicore_stream);
+    int wait_run_fence(const PreparedExecution &prepared);
 
     /**
      * Give up this run's arming. Idempotent and a no-op for a run that never
@@ -2011,14 +2288,10 @@ protected:
      * naming an event that must not be destroyed, so the device is recovered or
      * marked unusable and the first error is returned.
      */
-    int discharge_boundary_waits(
-        const PreparedExecution &prepared, bool boundaries_complete, rtStream_t aicpu_stream, rtStream_t aicore_stream
-    );
+    int discharge_boundary_waits(const PreparedExecution &prepared, bool boundaries_complete);
 
     /** The same ladder from a path that cannot report, poisoning on failure. */
-    void discharge_boundary_waits_noexcept(
-        const PreparedExecution &prepared, bool boundaries_complete, rtStream_t aicpu_stream, rtStream_t aicore_stream
-    ) noexcept;
+    void discharge_boundary_waits_noexcept(const PreparedExecution &prepared, bool boundaries_complete) noexcept;
 
     /**
      * Take this runner's reference on the process's exception-notification
@@ -2091,7 +2364,9 @@ protected:
      * caller propagates the rc and the run is rolled back rather than collected
      * by the destructive single-run path.
      */
-    int start_shared_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch);
+    int start_shared_collectors_for_run(
+        const DfxRunConfig &dfx, uint64_t run_epoch, const RunLocalDfxMetadata &run_metadata
+    );
 
     /**
      * Give back what `start_shared_collectors_for_run` admitted for a run that
@@ -2201,8 +2476,8 @@ protected:
     CollectorShape collector_shape_{};
 
     /**
-     * Shared body of `finalize()`. Each arch subclass's `finalize()`
-     * handles: (a) the early-return + thread attach prologue, (b) any
+     * Shared cleanup body called by each arch subclass's `finalize_impl()`.
+     * The subclass handles: (a) thread attachment, (b) any
      * arch-specific collector teardown (e.g. a2a3's `dep_gen_collector_`),
      * and (c) the arch-specific device reset (a2a3's ACL/rt branch vs
      * a5's `rtDeviceReset`). Everything else lives here:
@@ -2338,7 +2613,7 @@ protected:
         // The callable's func_id -> CoreCallable object address table, dense
         // over [0, table_len) and the host source the device copy was made
         // from. `table_len` is one past the callable's largest child func_id,
-        // never RUNTIME_MAX_FUNC_ID: the content hash covers the child func_ids
+        // never CHIP_MAX_FUNC_ID: the content hash covers the child func_ids
         // and offsets, so every cid sharing this entry has exactly this table.
         std::vector<uint64_t> object_table;
         uint64_t object_table_dev{0};
@@ -2373,6 +2648,11 @@ protected:
         void *host_orch_func_ptr{nullptr};
     };
     std::unordered_map<int32_t, CallableState> callables_;
+    // Held by every registration/unregistration entry point and by
+    // finalize_device. It makes an auto-ID scan and its claim atomic against
+    // an explicit-ID claim of the same slot; runs, initialization and destroy
+    // are serialized by their callers instead.
+    std::mutex callable_registration_mu_;
     // Opaque provider handle from dma_workspace_provision(), owned for the
     // Worker's life and released by finalize_common(). Null unless the Worker
     // was created with SDMA enabled.
@@ -2407,7 +2687,7 @@ protected:
         bool permits_prepared_successor{false};
     };
     mutable std::mutex native_run_mu_;
-    std::array<NativeRunReservation, PTO_PIPELINE_MAX_DEPTH> native_run_reservations_{};
+    RunResourceSlots<NativeRunReservation> native_run_reservations_;
     struct NativeRunClaim {
         const void *owner{nullptr};
         NativeRunIdentity identity{};
@@ -2425,8 +2705,13 @@ protected:
     // run that is leaving, so an out-of-order release — a fast successor
     // finishing first — removes only its own entry and preserves the order of
     // the rest.
-    std::array<NativeRunClaim, PTO_PIPELINE_MAX_DEPTH> active_native_runs_{};
+    RunResourceSlots<NativeRunClaim> active_native_runs_;
     size_t active_native_run_count_{0};
+    // How many run-resource sets every per-set container above holds. Written
+    // last by `commit_run_resources`, so until a grant is published every bound
+    // check still answers for the previous one.
+    size_t granted_run_resource_sets_{0};
+
     /** Index of `owner` among the claim holders, or the array size when absent. */
     size_t native_run_claim_index(const void *owner) const;
 
@@ -2448,6 +2733,7 @@ protected:
     // and is never published.
     TeardownProof teardown_proof_{TeardownProof::NotAttempted};
     ExecutionModeLatch execution_mode_latch_;
+    bool program_initialized_{false};
     KernelExecutionState kernel_exec_state_;
     PersistentKernelArgs persistent_args_;
     Runtime kernel_runtime_;
@@ -2512,6 +2798,11 @@ protected:
     // One budget and one ownership ledger for this context's workspace
     // regions. Off unless a caller latches a budget.
     WorkspaceManager workspace_;
+    // Which slots have proved they can carry a run, who may grow now, and what
+    // each saved plan is waiting for. Holds no byte figure: whether a request
+    // fits is the allocator's answer, reported here only as a proof or a
+    // refusal. Empty and inert unless a context asks for automatic admission.
+    AutoAdmissionState auto_admission_;
 
     // Host mappings of child-memory allocations a host-side orchestrator has
     // touched — see HostApi acquire_child_memory_host_view. Keyed by allocation
@@ -2522,8 +2813,8 @@ protected:
     // (see HostApi get/set_retained_temp_buffer). Just a remembered
     // {addr, size} that the slot reuses across its runs and finalize frees;
     // the grow/slice logic lives in utils/retained_temp_bump.h.
-    std::array<void *, PTO_PIPELINE_MAX_DEPTH> retained_temp_addrs_{};
-    std::array<std::size_t, PTO_PIPELINE_MAX_DEPTH> retained_temp_sizes_{};
+    RunResourceSlots<void *> retained_temp_addrs_;
+    RunResourceSlots<std::size_t> retained_temp_sizes_;
     // One pipeline slot's Graph Definition staging: host bytes the recorders
     // build their objects into and the bind packs into the run's AICPU launch
     // package. Grow-only and content-preserving, because a bind knows the run's
@@ -2534,12 +2825,12 @@ protected:
     struct RetainedGraphStaging {
         std::vector<std::byte> bytes;
     };
-    std::array<RetainedGraphStaging, PTO_PIPELINE_MAX_DEPTH> graph_definition_staging_{};
+    RunResourceSlots<RetainedGraphStaging> graph_definition_staging_;
     // Scheduler-state storage, one retained pair per pipeline slot — see
     // HostApi acquire_scheduler_state_storage and utils/retained_scheduler_storage.h,
     // which holds the grow, alignment and failure rules. One pair per slot
     // because a slot's runs are serialized while different slots' runs are not.
-    std::array<RetainedSchedulerStorage, PTO_PIPELINE_MAX_DEPTH> scheduler_state_storage_{};
+    RunResourceSlots<RetainedSchedulerStorage> scheduler_state_storage_;
     // Host mirror of the runtime shared memory, one retained buffer per pipeline
     // slot — see HostApi acquire_sm_mirror. A host-side orchestrator writes its
     // whole shared-memory image here and the bind ships the live prefix, so the
@@ -2559,7 +2850,9 @@ protected:
         std::unique_ptr<std::byte[]> storage;
         std::size_t capacity{0};
     };
-    std::array<RetainedSmMirror, PTO_PIPELINE_MAX_DEPTH> sm_mirrors_{};
+    RunResourceSlots<std::shared_ptr<void>> orchestration_scratch_;
+    RunResourceSlots<std::shared_ptr<void>> prepare_plans_;
+    RunResourceSlots<RetainedSmMirror> sm_mirrors_;
 
     // Host staging for the device execution image, one retained buffer per
     // pipeline slot — see HostApi acquire_run_image_staging. Same block shape
@@ -2569,7 +2862,7 @@ protected:
     // afterwards, so this buffer is what makes the source outlive the
     // preparation. Sized to the image a bind ships rather than to the
     // mirror's capacity.
-    std::array<RetainedSmMirror, PTO_PIPELINE_MAX_DEPTH> run_image_stagings_{};
+    RunResourceSlots<RetainedSmMirror> run_image_stagings_;
 
     // One independently committed set of the three pooled device regions. A
     // run reaches its set through the arena bank its lease selects, so
@@ -2590,15 +2883,16 @@ protected:
         size_t cached_gm_sm_size{0};
         size_t cached_runtime_arena_size{0};
     };
-    // Held by pointer because DeviceArena is non-copyable and non-movable, so
-    // the array cannot be brace-initialised without naming every bank.
-    std::array<std::unique_ptr<ArenaBank>, PTO_PIPELINE_MAX_DEPTH> arena_banks_;
+    // Held by pointer because DeviceArena is non-copyable and non-movable, so a
+    // bank is constructed in place with its allocator rather than default-built
+    // with the rest of its set.
+    RunResourceSlots<std::unique_ptr<ArenaBank>> arena_banks_;
     ArenaBank &arena_bank(uint32_t bank_id) { return *arena_banks_[bank_id]; }
 
     // The device blocks each pipeline slot reuses across its runs. Committed on
     // a slot's first prepare and released in finalize(), so a steady-state run
     // rewrites their contents instead of reallocating them.
-    std::array<SlotPersistentArgs, PTO_PIPELINE_MAX_DEPTH> slot_persistent_args_;
+    RunResourceSlots<SlotPersistentArgs> slot_persistent_args_;
 
     // One completion fence per pipeline slot. The events are runner-owned for
     // the same reason the blocks above are: a reuse-capable event re-records
@@ -2607,7 +2901,73 @@ protected:
     // slot's next run cannot read the previous one's completion. Held by
     // pointer because the fence is non-copyable, so the array cannot be
     // brace-initialised without naming every slot.
-    std::array<std::unique_ptr<RunCompletionFence>, PTO_PIPELINE_MAX_DEPTH> run_fences_;
+    RunResourceSlots<std::unique_ptr<RunCompletionFence>> run_fences_;
+    RunResourceSlots<std::unique_ptr<RunCallerOrder>> caller_orders_;
+
+    /**
+     * Per-set storage an arch runner owns itself, built but not yet adopted.
+     *
+     * Opaque to the base, which only carries it from the build phase to the
+     * commit phase. A runner with no per-set storage of its own leaves it empty.
+     */
+    struct ArchRunResourceStaging {
+        RunProgressSlots::Storage run_progress;
+        RunStreamPair::Storage run_streams;
+    };
+
+    /** One built, unpublished grant: every per-set container's new storage. */
+    struct RunResourceStaging {
+        RunResourceSlots<NativeRunReservation>::Storage native_run_reservations;
+        RunResourceSlots<NativeRunClaim>::Storage active_native_runs;
+        RunResourceSlots<void *>::Storage retained_temp_addrs;
+        RunResourceSlots<std::size_t>::Storage retained_temp_sizes;
+        RunResourceSlots<RetainedGraphStaging>::Storage graph_definition_staging;
+        RunResourceSlots<RetainedSchedulerStorage>::Storage scheduler_state_storage;
+        RunResourceSlots<std::shared_ptr<void>>::Storage orchestration_scratch;
+        RunResourceSlots<std::shared_ptr<void>>::Storage prepare_plans;
+        RunResourceSlots<RetainedSmMirror>::Storage sm_mirrors;
+        RunResourceSlots<RetainedSmMirror>::Storage run_image_stagings;
+        RunResourceSlots<std::unique_ptr<ArenaBank>>::Storage arena_banks;
+        RunResourceSlots<SlotPersistentArgs>::Storage slot_persistent_args;
+        RunResourceSlots<std::unique_ptr<RunCompletionFence>>::Storage run_fences;
+        RunResourceSlots<std::unique_ptr<RunCallerOrder>>::Storage caller_orders;
+        RunResourceSlots<NativeRunIdentity>::Storage whole_operator_boundaries;
+        RunResourceSlots<void *>::Storage device_wall_dev_ptrs;
+        RunResourceSlots<DeviceRunTiming>::Storage device_run_timing;
+        RunResourceSlots<bool>::Storage device_timing_armed;
+        RunResourceSlots<void *>::Storage device_run_result_dev_ptrs;
+        RunResourceSlots<DeviceRunResultRegion>::Storage device_run_results;
+        RunResourceSlots<bool>::Storage device_run_result_initialized;
+        RunResourceSlots<HostPhaseRunState>::Storage host_phase_runs;
+        RunRecordReadLedger::Storage device_run_result_reads;
+        RunBoundaryLedger::Storage run_boundaries_observed;
+        QueuedStreamWaits::Storage queued_waits;
+        RunBoundaryMarks::Storage boundary_marks;
+        WorkspaceManager::Storage workspace_runs;
+        ArchRunResourceStaging arch;
+    };
+
+    /** Allocate every per-set resource for `granted`; publishes nothing. */
+    RunResourceStaging build_run_resources(size_t granted);
+    /** Adopt a built grant by swapping every container. Never throws. */
+    void commit_run_resources(size_t granted, RunResourceStaging &&staged) noexcept;
+
+    /**
+     * Build whatever per-set storage an arch runner owns itself.
+     *
+     * Reached from the base's build phase, so a subclass's own tables take part
+     * in the same all-or-nothing grant rather than being resized afterwards.
+     * Not reached from the constructor — a subclass is not built yet there — so
+     * each such owner also default-sizes itself to the standing default.
+     */
+    virtual ArchRunResourceStaging build_arch_run_resources(size_t granted) {
+        (void)granted;
+        return {};
+    }
+    /** Adopt the arch storage built above. Never throws. */
+    virtual void commit_arch_run_resources(ArchRunResourceStaging &&staged) noexcept { (void)staged; }
+    /** Whether an arch runner's own per-set storage may be replaced right now. */
+    virtual bool arch_run_resources_are_replaceable() const { return true; }
 
     // Every stream wait queued on one of those boundaries, across all slots.
     // One table rather than one per slot: a cross-run wait names two runs, and
@@ -2625,7 +2985,7 @@ protected:
     // because it is read by a *successor's* launch to decide whether the run it
     // was ordered behind can be joined at all.
     mutable std::mutex whole_operator_mu_;
-    std::array<NativeRunIdentity, PTO_PIPELINE_MAX_DEPTH> whole_operator_boundaries_{};
+    RunResourceSlots<NativeRunIdentity> whole_operator_boundaries_;
 
     // What this runner's finalize() observed about its own device teardown.
     // Outlives nothing: `copy_teardown_report` must be called while the runner
@@ -2720,45 +3080,41 @@ protected:
     // and only pulls the tail when the header marks it used.
     //
     // One buffer per pipeline slot, allocated lazily on that slot's first
-    // capture-enabled run and freed in subclass `finalize()`. Per slot rather
+    // capture-enabled run and freed in subclass `finalize_impl()`. Per slot rather
     // than per run so the hot path does no device malloc/free, and rather than
     // one shared buffer because the device writes it for the whole of a run
     // while the host reads it only at that run's drain — a successor armed into
     // the same storage would corrupt both.
-    std::array<void *, PTO_PIPELINE_MAX_DEPTH> device_wall_dev_ptrs_{};
+    RunResourceSlots<void *> device_wall_dev_ptrs_;
     // Per-slot readback results; see device_run_timing().
-    std::array<DeviceRunTiming, PTO_PIPELINE_MAX_DEPTH> device_run_timing_{};
-    // Set when a slot's buffer is successfully reset for a launch, cleared when
-    // finalize has finished with the result. It answers two questions from the
-    // one fact, because both are "this slot's buffer is reset and unread":
-    // `arm_device_wall_buffer` refuses while it is set, so a successor cannot
-    // overwrite an unconsumed result; `read_device_wall_ns` skips while it is
-    // clear, so a run whose reset failed does not publish the storage's
-    // previous contents as its own timing.
-    std::array<bool, PTO_PIPELINE_MAX_DEPTH> device_timing_armed_{};
+    RunResourceSlots<DeviceRunTiming> device_run_timing_;
+    // An accepted publication arms the slot; retirement consumes its result.
+    // Preparation cannot overwrite an armed slot. Failed publication leaves it
+    // unarmed, so readback cannot misattribute a predecessor's timing.
+    RunResourceSlots<bool> device_timing_armed_;
     // One result region per pipeline slot: the device address handed to that
     // slot's runs, and the host's copy of what the last such run published. Not
     // gated on diagnostics — an error result must survive with capture off.
-    std::array<void *, PTO_PIPELINE_MAX_DEPTH> device_run_result_dev_ptrs_{};
-    std::array<DeviceRunResultRegion, PTO_PIPELINE_MAX_DEPTH> device_run_results_{};
+    RunResourceSlots<void *> device_run_result_dev_ptrs_;
+    RunResourceSlots<DeviceRunResultRegion> device_run_results_;
     // Which run each cached copy was read for, and what that read left behind.
     // Together they make the read once-per-run and keep the three read states
     // apart: an empty copy read successfully is an absent record, an empty copy
     // left by a failed D2H is no observation at all, and a slot with no region
     // attempted no copy to lose.
-    RunRecordReadLedgerT<PTO_PIPELINE_MAX_DEPTH> device_run_result_reads_;
+    RunRecordReadLedger device_run_result_reads_;
     // The boundary completion each run's own drain or poll observed, retained
     // because the drain's cleanup retires the fence that could otherwise be
     // asked. See host/run_evidence_retention.h.
-    RunBoundaryLedgerT<PTO_PIPELINE_MAX_DEPTH> run_boundaries_observed_;
+    RunBoundaryLedger run_boundaries_observed_;
     // Whether a slot's region has had `published` zeroed since it was
     // allocated. `allocate_tensor` is an `rtMalloc`, so a fresh region holds
     // whatever the device left there — which cannot be assumed to differ from
     // the epoch of the run about to use it. Steady-state reuse needs no clear
     // because epochs distinguish runs, but the first use of an allocation does.
-    std::array<bool, PTO_PIPELINE_MAX_DEPTH> device_run_result_initialized_{};
+    RunResourceSlots<bool> device_run_result_initialized_;
 
-    // True after AICPU SO loaded; reset by the subclass's `finalize()`.
+    // True after AICPU SO loaded; reset by the subclass's `finalize_impl()`.
     bool binaries_loaded_{false};
     // Per-device guard for the initial simpler_aicpu_init launch.
     bool aicpu_init_launched_{false};
@@ -2773,7 +3129,7 @@ protected:
     // independently, so it belongs to neither. One per pipeline slot, because a
     // bind is preparation and a prepared successor prepares while its
     // predecessor still owns the collectors — see host_phase_run_state.h.
-    std::array<HostPhaseRunState, PTO_PIPELINE_MAX_DEPTH> host_phase_runs_{};
+    RunResourceSlots<HostPhaseRunState> host_phase_runs_;
     ArgsDumpCollector dump_collector_;
     PmuCollector pmu_collector_;
     ScopeStatsCollector scope_stats_collector_;

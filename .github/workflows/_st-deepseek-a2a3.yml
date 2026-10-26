@@ -20,7 +20,7 @@ jobs:
   run:
     name: st-deepseek-onboard-a2a3
     runs-on: ${{ fromJSON(inputs.runs_on) }}
-    timeout-minutes: 30
+    timeout-minutes: 40
     env:
       SIMPLER_SCHEDULER_TIMEOUT_MS: "10000"
       SIMPLER_OP_EXECUTE_TIMEOUT_US: "45000000"
@@ -69,7 +69,7 @@ jobs:
           test -n "$runtimes"
           for runtime in $runtimes; do
             .venv/bin/python "examples/a2a3/$runtime/deepseek_v4_flash_decode/main.py" \
-              --platform a2a3 --compile-only --compile-workers 8
+              --platform a2a3 --compile-only --compile-workers 64
           done
 
       # The DS cases are the only manual tests under these two directories, so

@@ -82,8 +82,13 @@ PmuCollector::~PmuCollector() {
 
 int PmuCollector::init(
     int num_cores, int num_threads, const PmuAllocCallback &alloc_cb, PmuRegisterCallback register_cb,
-    const PmuFreeCallback &free_cb, int device_id
-) {
+    const PmuFreeCallback &free_cb, int device_id, PmuUnregisterCallback unregister_cb
+) try {
+    if (register_cb != nullptr && unregister_cb == nullptr) {
+        LOG_ERROR("Pmu collector registration requires an unregister callback");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+
     if (num_cores <= 0 || num_threads <= 0 || alloc_cb == nullptr || free_cb == nullptr) {
         LOG_ERROR("PmuCollector::init: invalid arguments");
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -123,28 +128,26 @@ int PmuCollector::init(
     }
 
     // Stash callbacks on the base up-front so alloc_paired_buffer sees
-    // consistent values during init. shm_host_ stays nullptr until the shm
-    // allocation succeeds — start(tf) gates on shm_host_.
+    // consistent values during init. Shared memory remains unpublished until
+    // every acquisition and initial upload succeeds.
     set_memory_context(
         alloc_cb, register_cb, free_cb, profiling_copy_to_device_for_ops, profiling_copy_from_device_for_ops,
-        /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id
+        /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id, unregister_cb
     );
 
-    // RAII rollback: any early return after this point releases the shm
-    // region + ring address table + per-core PmuAicoreRing + per-core
-    // PmuBuffers. Per-core rings are tracked separately via
-    // `guard.add_direct_ptr()` because they're plain alloc_cb allocations
-    // (no host shadow / not in dev_to_host_). `guard.commit()` runs on the
-    // success path before the trailing return 0.
-    profiling_common::InitRollbackGuard<decltype(manager_)> guard(manager_, free_cb);
+    // Every allocation is tracked by its actual host-view and registration state.
+    profiling_common::InitRollbackGuard<decltype(manager_)> guard(
+        manager_, free_cb, register_cb != nullptr ? unregister_cb : nullptr, device_id
+    );
 
+    int allocation_rc = 0;
     // ---- Allocate shared header + buffer-state region ----
     size_t shm_size = calc_pmu_data_size(num_cores);
     void *shm_host_local = nullptr;
-    void *shm_dev_local = alloc_paired_buffer(shm_size, &shm_host_local);
+    void *shm_dev_local = alloc_paired_buffer(shm_size, &shm_host_local, &allocation_rc);
     if (shm_dev_local == nullptr) {
         LOG_ERROR("PmuCollector: failed to allocate PMU shared memory (%zu bytes)", shm_size);
-        return PTO_RUNTIME_ERR_INTERNAL;
+        return allocation_rc;
     }
 
     std::memset(shm_host_local, 0, shm_size);
@@ -158,16 +161,14 @@ int PmuCollector::init(
     // so no separate PMU reg-address table is needed.
     // Held in locals and published to the aicore_rings_dev_ / aicore_ring_addrs_*
     // members only after guard.commit() (see end of this function). The table
-    // alloc registers in the rollback guard and each ring is added via
-    // add_direct_ptr, so a later init failure frees them; assigning the members
-    // here would leave them dangling at freed memory.
+    // and every device-only ring are manager-owned before publication.
     std::vector<void *> aicore_rings_dev_local(num_cores, nullptr);
     size_t table_size = static_cast<size_t>(num_cores) * sizeof(uint64_t);
     void *ring_addrs_host_local = nullptr;
-    void *ring_addrs_dev_local = alloc_paired_buffer(table_size, &ring_addrs_host_local);
+    void *ring_addrs_dev_local = alloc_paired_buffer(table_size, &ring_addrs_host_local, &allocation_rc);
     if (ring_addrs_dev_local == nullptr) {
         LOG_ERROR("PmuCollector: failed to allocate aicore ring address table (%zu bytes)", table_size);
-        return PTO_RUNTIME_ERR_INTERNAL;
+        return allocation_rc;
     }
     std::memset(ring_addrs_host_local, 0, table_size);
 
@@ -178,22 +179,21 @@ int PmuCollector::init(
         PmuBufferState *state = get_pmu_buffer_state(shm_host_local, c);
 
         // Allocate the per-core stable PmuAicoreRing (no host shadow needed).
-        void *ring_dev = alloc_cb(sizeof(PmuAicoreRing));
+        void *ring_dev = alloc_device_buffer(sizeof(PmuAicoreRing));
         if (ring_dev == nullptr) {
             LOG_ERROR("PmuCollector: failed to allocate PmuAicoreRing for core %d", c);
             return PTO_RUNTIME_ERR_INTERNAL;
         }
         aicore_rings_dev_local[c] = ring_dev;
-        guard.add_direct_ptr(ring_dev);
         state->aicore_ring_ptr = reinterpret_cast<uint64_t>(ring_dev);
         reinterpret_cast<uint64_t *>(ring_addrs_host_local)[c] = reinterpret_cast<uint64_t>(ring_dev);
 
         for (int b = 0; b < PLATFORM_PMU_BUFFERS_PER_CORE; b++) {
             void *host_ptr = nullptr;
-            void *dev_ptr = alloc_paired_buffer(buf_size, &host_ptr);
+            void *dev_ptr = alloc_paired_buffer(buf_size, &host_ptr, &allocation_rc);
             if (dev_ptr == nullptr) {
                 LOG_ERROR("PmuCollector: failed to allocate PmuBuffer c=%d b=%d", c, b);
-                return PTO_RUNTIME_ERR_INTERNAL;
+                return allocation_rc;
             }
 
             if (b < PLATFORM_PMU_SLOT_COUNT) {
@@ -211,11 +211,11 @@ int PmuCollector::init(
     }
 
     // Push the populated ring address table to device.
-    profiling_copy_to_device(ring_addrs_dev_local, ring_addrs_host_local, table_size);
+    if (int rc = profiling_copy_to_device(ring_addrs_dev_local, ring_addrs_host_local, table_size); rc != 0) return rc;
 
     // Push the entire initialized shm region (header + BufferStates +
     // free_queue contents) to device.
-    profiling_copy_to_device(shm_dev_local, shm_host_local, shm_size);
+    if (int rc = profiling_copy_to_device(shm_dev_local, shm_host_local, shm_size); rc != 0) return rc;
 
     rebuild_csv_header();
 
@@ -224,23 +224,15 @@ int PmuCollector::init(
         num_threads, reinterpret_cast<unsigned long>(shm_dev_local), csv_path_.c_str()
     );
     guard.commit();
-    // Publish device-buffer members, the shm/memory context, and the
-    // initialized_ flag only after the rollback guard is disarmed. On a failed
-    // init they stay at their defaults — initialized_ stays false, so
-    // is_initialized() reports false and finalize() never runs against buffers
-    // the guard already freed. set_memory_context also publishes shm_host_;
-    // start(tf) gates on it, so this is the moment the collector becomes
-    // startable. initialized_ is published last, once everything else is set.
     aicore_rings_dev_ = std::move(aicore_rings_dev_local);
     aicore_ring_addrs_dev_ = ring_addrs_dev_local;
     aicore_ring_addrs_host_ = ring_addrs_host_local;
     shm_dev_ = shm_dev_local;
-    set_memory_context(
-        alloc_cb, register_cb, free_cb, profiling_copy_to_device_for_ops, profiling_copy_from_device_for_ops,
-        shm_dev_local, shm_host_local, shm_size, device_id
-    );
+    publish_shared_memory(shm_dev_local, shm_host_local, shm_size);
     initialized_ = true;
     return 0;
+} catch (const std::bad_alloc &) {
+    return PTO_RUNTIME_ERR_INTERNAL;
 }
 
 void PmuCollector::start(const profiling_common::ThreadFactory &thread_factory) {
@@ -724,6 +716,8 @@ void PmuCollector::finalize(PmuUnregisterCallback unregister_cb, const PmuFreeCa
         csv_file_.close();
     }
 
+    if (!validate_release_callbacks(unregister_cb, free_cb)) return;
+
     auto release_dev = [&](void *p) {
         release_one_buffer(p, unregister_cb, free_cb);
     };
@@ -759,13 +753,10 @@ void PmuCollector::finalize(PmuUnregisterCallback unregister_cb, const PmuFreeCa
         release_dev(p);
     });
 
-    // Free per-core PmuAicoreRings (no host shadow paired). The rings were
-    // allocated directly via alloc_cb (not alloc_paired_buffer), so no entry
-    // exists in dev_to_host_ for them.
+    // Device-only rings share the ownership and release-failure accounting
+    // path without acquiring a host mapping or a HAL registration.
     for (auto *ring_dev : aicore_rings_dev_) {
-        if (ring_dev != nullptr) {
-            release_dev(ring_dev);
-        }
+        release_dev(ring_dev);
     }
     aicore_rings_dev_.clear();
 

@@ -1553,6 +1553,28 @@ class TestChipCallable:
     def _make_child(self, sig, binary):
         return CoreCallable.build(signature=sig, binary=binary)
 
+    @pytest.mark.parametrize("child_count", [1025, 1427, ChipCallable.MAX_CHILDREN - 1, ChipCallable.MAX_CHILDREN])
+    def test_large_child_count(self, child_count):
+        child = self._make_child([], b"\x01")
+        chip = ChipCallable.build(
+            signature=[],
+            func_name="large",
+            binary=b"",
+            children=[(index, child) for index in range(child_count)],
+        )
+        assert chip.child_count == child_count
+        assert chip.child_func_id(child_count - 1) == child_count - 1
+
+    def test_child_count_overflow(self):
+        child = self._make_child([], b"\x01")
+        with pytest.raises(ValueError, match="child_count exceeds MaxChildren"):
+            ChipCallable.build(
+                signature=[],
+                func_name="overflow",
+                binary=b"",
+                children=[(index, child) for index in range(ChipCallable.MAX_CHILDREN + 1)],
+            )
+
     def test_signature_capacity(self):
         chip = ChipCallable.build(
             signature=[ArgDirection.IN] * 256,

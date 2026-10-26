@@ -100,7 +100,6 @@ public:
         Runtime &runtime, const CallConfig &config, uint32_t pipeline_slot, const NativeRunIdentity &identity,
         std::unique_ptr<PreparedExecution> *prepared
     ) override;
-    LaunchOutcome launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) override;
     void abandon_prepared_execution(PreparedExecution &prepared) noexcept override;
     int poll_execution(const ActiveExecution &active) override;
     DrainOutcome drain_execution(ActiveExecution &active) override;
@@ -136,16 +135,6 @@ public:
     void withdraw_dep_gen_run(uint64_t run_epoch) noexcept override;
     bool dep_gen_flush_retained(int timeout_ms, std::string *error) override;
     void dep_gen_finish_retained() override;
-
-    /**
-     * Cleanup all resources
-     *
-     * Frees all device memory, destroys streams, and resets state.
-     * Use this for final cleanup when no more tests will run.
-     *
-     * @return 0 on success, error code on failure
-     */
-    int finalize() override;
 
     /**
      * a5 fills the per-core register table only: it has no ffts_base_addr
@@ -195,6 +184,10 @@ public:
     int destroy_comm_stream(void *stream);
 
 private:
+    LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override;
+
+    int finalize_impl() override;
+
     // Most lifecycle state (device_id_, block_dim_, cores_per_blockdim_,
     // executor + dispatcher bytes, aicore_bin_handle_,
     // load_aicpu_op_, mem_alloc_, the three DeviceArenas + their cached
@@ -245,6 +238,18 @@ private:
     // check relies on.
     RunProgressSlots run_progress_;
 
+protected:
+    /** The progress table holds one slot per run-resource set. */
+    ArchRunResourceStaging build_arch_run_resources(size_t granted) override {
+        ArchRunResourceStaging staged;
+        staged.run_progress = RunProgressSlots::build(granted);
+        return staged;
+    }
+    void commit_arch_run_resources(ArchRunResourceStaging &&staged) noexcept override {
+        run_progress_.commit(std::move(staged.run_progress));
+    }
+
+private:
     // Queue this run's own AICore boundary into the AICPU stream, ahead of the
     // AICPU boundary record that then covers the whole operator. The reservation
     // is taken by the caller, so a refusal costs only joinability; this is the

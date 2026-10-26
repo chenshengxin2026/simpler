@@ -46,6 +46,8 @@ if TYPE_CHECKING:
     # Annotation-only: `CallableHandle` is imported lazily at its use site, and
     # PEP 563 keeps these annotations as strings, so nothing is imported at
     # runtime.
+    from simpler_setup.runtime_builder import RuntimeBinaries
+
     from .callable_identity import CallableHandle
 
 import _task_interface as _ti_module  # pyright: ignore[reportMissingImports]
@@ -56,6 +58,11 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     MAILBOX_OFF_ERROR_MSG,
     MAILBOX_OFF_TEARDOWN_REPORT,
     MAILBOX_PREPARATION_DISPOSITION_VALUES,
+    MAILBOX_REQUEST_FRAME_OFFSETS,
+    MAILBOX_REQUEST_FRAMES,
+    MAILBOX_RUN_ENTRY_OFFSETS,
+    MAILBOX_RUN_ENTRY_STRIDE,
+    MAILBOX_RUN_ENTRY_TABLE_OFFSET,
     MAILBOX_SIZE,
     MAILBOX_STATE_VALUES,
     MAILBOX_TASK_PROTOCOL_VERSION,
@@ -73,7 +80,9 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     CoreCallable,
     DataType,
     DeviceMemoryInfo,
+    ExecutionContextRefused,
     ProvenanceTable,
+    RunPreparationRefused,
     RuntimeEnv,
     TaskArgs,
     TaskHandle,
@@ -85,6 +94,8 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     arg_direction_name,
     get_dtype_name,
     get_element_size,
+    mailbox_run_entry_count,
+    mailbox_size,
     read_args_from_blob,
 )
 from _task_interface import (
@@ -135,6 +146,19 @@ def _validate_host_control_access(target: ChipCallable | None, args: TaskArgs) -
         # actual host reads/writes, so a weaker caller tag cannot widen the grant.
         if needed is None or buffer.access not in (needed, AccessMode.READWRITE):
             raise ValueError(f"argument {i}: HOST/NONE Buffer grant does not cover callable direction {direction}")
+
+
+def _materialize_chip_task_args(args: TaskArgs, registry: ImportRegistry) -> ChipStorageTaskArgs:
+    """Resolve accepted argument descriptors into this process's chip-only POD.
+
+    The caller owns submission/callable checks, backing retention and the registry's
+    lifetime. Mapping and conversion do not copy tensor contents or close imports,
+    including when a later descriptor fails to resolve.
+    """
+    if not isinstance(args, TaskArgs):
+        raise TypeError("chip argument materialization requires address-free TaskArgs")
+    resolved = registry.materialize_args(args)
+    return _ti_module.materialize_task_args(args, resolved)
 
 
 def _assert_bindings_match_source_tree() -> None:
@@ -206,6 +230,8 @@ from .global_comm_domain import GlobalDomainAttachment, GlobalDomainBuffer, Glob
 __all__ = [
     "DataType",
     "DeviceMemoryInfo",
+    "ExecutionContextRefused",
+    "RunPreparationRefused",
     "get_element_size",
     "get_dtype_name",
     "MAX_TENSOR_DIMS",
@@ -236,6 +262,13 @@ __all__ = [
     "PROV_DESCRIPTOR_MISMATCH",
     "_Worker",
     "MAILBOX_SIZE",
+    "MAILBOX_REQUEST_FRAMES",
+    "MAILBOX_REQUEST_FRAME_OFFSETS",
+    "MAILBOX_RUN_ENTRY_OFFSETS",
+    "MAILBOX_RUN_ENTRY_STRIDE",
+    "MAILBOX_RUN_ENTRY_TABLE_OFFSET",
+    "mailbox_size",
+    "mailbox_run_entry_count",
     "MAILBOX_FRAME_SIZE",
     "MAILBOX_OFF_ERROR_MSG",
     "MAILBOX_ERROR_MSG_SIZE",
@@ -1449,6 +1482,53 @@ def _resolve_collect_across_runs(collect_across_runs: bool | None, dfx_session: 
     return bool(dfx_session)
 
 
+def _initialize_chip_runtime(  # noqa: PLR0913 -- explicit binary, workspace and environment options initialize one native owner
+    impl: _ChipWorker,
+    device_id: int,
+    bins: RuntimeBinaries,
+    *,
+    log_level: int | None = None,
+    prewarm_config: CallConfig | None = None,
+    enable_sdma: bool = False,
+    collect_across_runs: bool = False,
+    workspace_budget_bytes: int = 0,
+    manage_workspace: bool = False,
+    requested_pipeline_depth: int = 0,
+    borrowed_context_generation: int | None = None,
+) -> None:
+    """Bind one native chip runtime from binary paths and initialize its host logger.
+
+    The caller owns lifecycle admission, callable slots and cleanup after failure.
+    """
+    _initialize_host_log(log_level)
+    dispatcher_path = getattr(bins, "dispatcher_path", None)
+    sim_context_path = getattr(bins, "sim_context_path", None)
+    sdma_warmup_path = getattr(bins, "sdma_warmup_path", None)
+    init_options = {}
+    if borrowed_context_generation is not None:
+        init_options["borrowed_context_generation"] = borrowed_context_generation
+        # Borrowed bootstrap takes no Program-owned SDMA warmup ELF.
+        sdma_warmup_path = None
+    # C++ retains libcpu_sim_context.so in the sim process registry. Sim has
+    # no dispatcher; onboard bootstrap consumes its actual binary path.
+    impl.init(
+        str(bins.host_path),
+        str(bins.aicpu_path),
+        str(bins.aicore_path),
+        "" if dispatcher_path is None else str(dispatcher_path),
+        int(device_id),
+        prewarm_config,
+        bool(enable_sdma),
+        "" if sim_context_path is None else str(sim_context_path),
+        "" if sdma_warmup_path is None else str(sdma_warmup_path),
+        bool(collect_across_runs),
+        int(workspace_budget_bytes),
+        bool(manage_workspace),
+        int(requested_pipeline_depth),
+        **init_options,
+    )
+
+
 class ChipWorker:
     """Unified execution interface wrapping the host runtime C API.
 
@@ -1613,28 +1693,17 @@ class ChipWorker:
             self._init_in_progress = True
 
         try:
-            _initialize_host_log(log_level)
-
-            # C++ retains libcpu_sim_context.so in the sim process registry,
-            # loads host_runtime.so, and binds both private logger copies.
-            # dispatcher_path is empty on sim; onboard consumes the real path.
-            dispatcher_path = getattr(bins, "dispatcher_path", None)
-            sim_context_path = getattr(bins, "sim_context_path", None)
-            sdma_warmup_path = getattr(bins, "sdma_warmup_path", None)
-            self._impl.init(
-                str(bins.host_path),
-                str(bins.aicpu_path),
-                str(bins.aicore_path),
-                "" if dispatcher_path is None else str(dispatcher_path),
-                int(device_id),
-                prewarm_config,
-                bool(enable_sdma),
-                "" if sim_context_path is None else str(sim_context_path),
-                "" if sdma_warmup_path is None else str(sdma_warmup_path),
-                bool(_resolve_collect_across_runs(collect_across_runs, dfx_session)),
-                int(workspace_budget_bytes),
-                bool(manage_workspace),
-                int(requested_pipeline_depth),
+            _initialize_chip_runtime(
+                self._impl,
+                device_id,
+                bins,
+                log_level=log_level,
+                prewarm_config=prewarm_config,
+                enable_sdma=enable_sdma,
+                collect_across_runs=_resolve_collect_across_runs(collect_across_runs, dfx_session),
+                workspace_budget_bytes=workspace_budget_bytes,
+                manage_workspace=manage_workspace,
+                requested_pipeline_depth=requested_pipeline_depth,
             )
             for slot_id, callable_obj in list(self._callable_registry.items()):
                 self._impl.register_callable(int(slot_id), callable_obj)
@@ -1753,6 +1822,8 @@ class ChipWorker:
             hashid_to_digest,
         )
 
+        if self.initialized:
+            self._impl._validate_execution_context()
         descriptor = build_chip_callable_descriptor(target=callable)
         hashid = compute_callable_hashid(descriptor)
         digest = hashid_to_digest(hashid)
@@ -1846,13 +1917,17 @@ class ChipWorker:
                 registry = ImportRegistry(ImportContext(deployment=DEVICE_AICPU))
                 self._argument_imports = registry
                 try:
-                    args = _ti_module.materialize_task_args(args, registry.materialize_args(args))
+                    args = _materialize_chip_task_args(args, registry)
                 except BaseException:
                     self._close_argument_imports()
                     raise
-            # A native exception leaves completion unproven. Imports remain live
-            # until successful device teardown; no finally block may unmap them.
-            self._impl.run(int(state.slot_id), args, config)
+            # Only a proven pre-execution refusal releases imports on an error;
+            # other native exceptions keep them through successful teardown.
+            try:
+                self._impl.run(int(state.slot_id), args, config)
+            except RunPreparationRefused:
+                self._close_argument_imports()
+                raise
             self._close_argument_imports()
 
     def _close_argument_imports(self) -> None:
@@ -1863,6 +1938,8 @@ class ChipWorker:
 
     def unregister_callable(self, handle) -> None:
         """Drop one live callable handle and release its private resources when final."""
+        if self.initialized:
+            self._impl._validate_execution_context()
         with self._registry_lock:
             state = self._resolve_handle_locked(handle)
             self._live_handles.pop(handle._handle_id, None)
@@ -1983,6 +2060,32 @@ class ChipWorker:
     def launch_depth(self):
         """How many runs this worker may have launched at once, after its request was resolved."""
         return self._impl.launch_depth
+
+    def enable_automatic_admission(self) -> bool:
+        """Let this worker's device context size its own run concurrency.
+
+        Asked once, after init, by a caller that specified no depth and no byte budget. Returns
+        False when the loaded module or the context cannot — a simulated backend, a borrowed
+        context, or a module without the entry — and the worker then admits exactly what it was
+        granted, as it did before.
+        """
+        return bool(self._impl._enable_automatic_admission())  # noqa: SLF001 -- no public equivalent
+
+    @property
+    def automatic_admission(self) -> bool:
+        """Whether this worker's context sizes its own run concurrency."""
+        return bool(self._impl.automatic_admission)
+
+    @property
+    def admissible_run_resource_sets(self) -> int:
+        """Run-resource sets this context reports it can hold right now.
+
+        A count of identities, never a byte figure: it is one until a run has completed its
+        resource commit, grows with what this context has proved it can hold, and falls when those
+        resources are reclaimed or become unprovable. The granted count on a context that does not
+        size itself.
+        """
+        return int(self._impl.admissible_run_resource_sets)
 
     def configure_launch_depth(self, depth):
         """Ask, before init, for a launch depth.

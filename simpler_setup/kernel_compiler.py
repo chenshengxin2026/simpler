@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import warnings
 from functools import cache
 from pathlib import Path
@@ -31,6 +32,7 @@ from .toolchain import (
 )
 
 logger = logging.getLogger(__name__)
+_ascend_include_search_lock = threading.Lock()
 
 # Covers the part of the persistent scene-test cache key that nothing else
 # fingerprints: how ``scene_test.compile_chip_callable_spec`` assembles
@@ -97,6 +99,44 @@ def _cmake_bool_env_enabled(name: str, default: bool = False) -> bool:
     if normalized in {"0", "OFF", "FALSE", "NO", "N"}:
         return False
     return default
+
+
+@cache
+def _ascend_incore_include_dirs(ascend_home: str) -> tuple[str, ...]:
+    """Find CANN header roots once per toolchain installation in this process."""
+    roots = [Path(ascend_home)]
+    roots += [Path(ascend_home) / arch for arch in ("aarch64-linux", "x86_64-linux")]
+
+    candidates: list[Path] = []
+    for root in roots:
+        candidates.extend(
+            [
+                root / "include",
+                root / "include" / "external",
+                root / "include" / "c_api",
+                root / "include" / "c_api" / "internal",
+                root / "asc" / "include",
+                root / "asc" / "include" / "interface",
+                root / "asc" / "include" / "basic_api",
+                root / "asc" / "include" / "basic_api" / "interface",
+                root / "ascendc" / "include",
+                root / "ascendc" / "include" / "basic_api",
+                root / "ascendc" / "include" / "basic_api" / "interface",
+            ]
+        )
+    for header in ("kernel_operator_sys_var_intf.h", "kernel_operator_sys_var_intf_impl.h"):
+        try:
+            candidates.extend(path.parent for path in Path(ascend_home).rglob(header))
+        except OSError:
+            continue
+
+    include_dirs = []
+    seen = set()
+    for path in candidates:
+        if path.is_dir() and path not in seen:
+            include_dirs.append(str(path))
+            seen.add(path)
+    return tuple(include_dirs)
 
 
 class KernelCompiler:
@@ -272,39 +312,8 @@ class KernelCompiler:
         ascend_home = env_manager.get("ASCEND_HOME_PATH")
         if not ascend_home:
             return []
-        roots = [Path(ascend_home)]
-        roots += [Path(ascend_home) / arch for arch in ("aarch64-linux", "x86_64-linux")]
-
-        candidates: list[Path] = []
-        for root in roots:
-            candidates.extend(
-                [
-                    root / "include",
-                    root / "include" / "external",
-                    root / "include" / "c_api",
-                    root / "include" / "c_api" / "internal",
-                    root / "asc" / "include",
-                    root / "asc" / "include" / "interface",
-                    root / "asc" / "include" / "basic_api",
-                    root / "asc" / "include" / "basic_api" / "interface",
-                    root / "ascendc" / "include",
-                    root / "ascendc" / "include" / "basic_api",
-                    root / "ascendc" / "include" / "basic_api" / "interface",
-                ]
-            )
-        for header in ("kernel_operator_sys_var_intf.h", "kernel_operator_sys_var_intf_impl.h"):
-            try:
-                candidates.extend(path.parent for path in Path(ascend_home).rglob(header))
-            except OSError:
-                continue
-
-        include_dirs = []
-        seen = set()
-        for path in candidates:
-            if path.is_dir() and path not in seen:
-                include_dirs.append(str(path))
-                seen.add(path)
-        return include_dirs
+        with _ascend_include_search_lock:
+            return list(_ascend_incore_include_dirs(str(ascend_home)))
 
     def _get_orchestration_config(self, runtime_name: str) -> tuple[list[str], list[str]]:
         """
@@ -354,6 +363,13 @@ class KernelCompiler:
                 for f in sorted(src_dir.iterdir()):
                     if f.suffix in (".cpp", ".c") and f.is_file():
                         source_files.append(str(f))
+        # Individually named sources, for a file whose directory holds more than the
+        # .so needs. Unlike source_dirs this names one file, so nothing beside it is
+        # swept in.
+        for src_file_rel in orch_cfg.get("source_files", []):
+            src_file = (config_dir / src_file_rel).resolve()
+            if src_file.is_file():
+                source_files.append(str(src_file))
 
         return include_dirs, source_files
 

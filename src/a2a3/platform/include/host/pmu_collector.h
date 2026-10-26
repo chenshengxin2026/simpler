@@ -229,7 +229,7 @@ public:
     // the event type reaches the device header and the CSV header string.
     int init(
         int num_cores, int num_threads, const PmuAllocCallback &alloc_cb, PmuRegisterCallback register_cb,
-        const PmuFreeCallback &free_cb, int device_id
+        const PmuFreeCallback &free_cb, int device_id, PmuUnregisterCallback unregister_cb = nullptr
     );
 
     // Start a run's collection window: bind its CSV destination and event
@@ -426,12 +426,7 @@ private:
     // Shared memory region (PmuDataHeader + PmuBufferState[]). shm_host_ /
     // device_id_ live on ProfilerBase (set via set_memory_context in init()).
     void *shm_dev_ = nullptr;
-    bool shm_registered_ = false;
     size_t shm_size_ = 0;
-
-    // True iff the per-buffer register_cb path was used at init time. Drives
-    // unregister-vs-free-only behavior in finalize.
-    bool buffers_registered_ = false;
 
     // CSV output. Collector shards stream rows into shard-local temp files on
     // the hot path; stop-time reconciliation merges them into the final CSV so

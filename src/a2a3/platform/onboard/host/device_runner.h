@@ -37,7 +37,7 @@
 
 #include "callable.h"
 #include "prepare_callable_common.h"
-#include "runtime_c_api.h"  // PTO_PIPELINE_MAX_DEPTH
+#include "runtime_c_api.h"
 #include "host/run_stream_pair.h"
 #include "common/kernel_args.h"
 #include "common/memory_barrier.h"
@@ -105,7 +105,6 @@ public:
         Runtime &runtime, const CallConfig &config, uint32_t pipeline_slot, const NativeRunIdentity &identity,
         std::unique_ptr<PreparedExecution> *prepared
     ) override;
-    LaunchOutcome launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) override;
     void abandon_prepared_execution(PreparedExecution &prepared) noexcept override;
     int poll_execution(const ActiveExecution &active) override;
     DrainOutcome drain_execution(ActiveExecution &active) override;
@@ -151,16 +150,6 @@ public:
     void withdraw_dep_gen_run(uint64_t run_epoch) noexcept override;
     bool dep_gen_flush_retained(int timeout_ms, std::string *error) override;
     void dep_gen_finish_retained() override;
-
-    /**
-     * Cleanup all resources
-     *
-     * Frees all device memory, destroys streams, and resets state.
-     * Use this for final cleanup when no more tests will run.
-     *
-     * @return 0 on success, error code on failure
-     */
-    int finalize() override;
 
     /**
      * a2a3 fills the AIC_CTRL per-core register table and the FFTS base
@@ -230,6 +219,10 @@ public:
     size_t run_stream_set_create_count() const override { return run_streams_.created_count(); }
 
 private:
+    LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override;
+
+    int finalize_impl() override;
+
     // Most lifecycle state (device_id_, block_dim_, cores_per_blockdim_,
     // executor + dispatcher bytes, aicore_bin_handle_,
     // load_aicpu_op_, mem_alloc_, the three DeviceArenas + their cached
@@ -263,11 +256,6 @@ private:
     // executor may poison the runner after a failed launch.
     std::atomic<bool> device_unusable_{false};
 
-    struct RunStreamSet {
-        rtStream_t aicpu{nullptr};
-        rtStream_t aicore{nullptr};
-    };
-
     // One pair carries every run: the execution claim is exclusive, so runs
     // reach the device one at a time and the stream orders them. Pipeline slots
     // index resources that preparation mutates, and preparing a run writes
@@ -281,6 +269,20 @@ private:
             return rtStreamDestroy(static_cast<rtStream_t>(stream));
         }
     };
+
+protected:
+    /** The unretired-owner table holds one entry per run this context may hold. */
+    ArchRunResourceStaging build_arch_run_resources(size_t granted) override {
+        ArchRunResourceStaging staged;
+        staged.run_streams = RunStreamPair::build(granted);
+        return staged;
+    }
+    void commit_arch_run_resources(ArchRunResourceStaging &&staged) noexcept override {
+        run_streams_.commit(std::move(staged.run_streams));
+    }
+    bool arch_run_resources_are_replaceable() const override { return run_streams_.grant_is_replaceable(); }
+
+private:
     int create_run_stream(void **out);
     int ensure_run_streams();
     // Retires the run pair on behalf of `owner`, the PreparedExecution that
