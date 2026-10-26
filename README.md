@@ -4,6 +4,8 @@
 
 Modular runtime for building and executing task dependency graphs on Ascend devices with coordinated AICPU and AICore execution. Three independently compiled programs (Host `.so`, AICPU `.so`, AICore `.o`) work together through clearly defined APIs.
 
+[WSE Calendar on A3](docs/wse-a3.md): deployment stubs and native launch support for the `wse-sim-1026` PyPTO FFN.
+
 ## Where simpler sits in the stack
 
 simpler is one layer of the [hw-native-sys](https://github.com/hw-native-sys) stack. Each repo below imports the ones to its left:
