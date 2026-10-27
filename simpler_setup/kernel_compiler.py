@@ -23,6 +23,7 @@ from simpler import env_manager
 
 from .compile_paths import compiler_visible_path
 from .environment import PROJECT_ROOT
+from .pto_isa import ensure_pto_isa_root, read_pto_isa_pin
 from .toolchain import (
     Aarch64GxxToolchain,
     CCECToolchain,
@@ -45,7 +46,13 @@ _COMPILE_CACHE_SCHEMA = 1
 # Modules whose logic turns kernel sources into artifact bytes: compiler
 # invocation and flags, toolchain selection, and the ELF section extraction
 # applied to every onboard incore.
-_ARTIFACT_LOGIC_MODULES = ("kernel_compiler.py", "toolchain.py", "compile_paths.py", "elf_parser.py")
+_ARTIFACT_LOGIC_MODULES = (
+    "kernel_compiler.py",
+    "toolchain.py",
+    "compile_paths.py",
+    "elf_parser.py",
+    "incore/cpu_sim_target.h",
+)
 
 _CPU_SIM_TARGET_FLAGS = {
     "a2a3sim": "-DPTO_CPU_SIM_TARGET_A2A3",
@@ -226,6 +233,10 @@ class KernelCompiler:
         return [
             *self.gxx15.get_compile_flags(core_type=core_type),
             target_flag,
+            "-include",
+            "pto/cpu/target_config.hpp",
+            "-include",
+            "cpu_sim_target.h",
             *self._sanitizer_flags(self.gxx15),
         ]
 
@@ -467,6 +478,7 @@ class KernelCompiler:
             "core_type": core_type,
             "flags": flags,
             "linker": linker,
+            "pto_isa_commit": read_pto_isa_pin() if self.platform.endswith("sim") else None,
         }
 
     def _run_subprocess(
@@ -594,7 +606,8 @@ class KernelCompiler:
         Args:
             source_path: Path to kernel source file (.cpp)
             core_type: Core type: "aic" (cube) or "aiv" (vector). Default: "aiv"
-            pto_isa_root: Path to PTO-ISA root directory. Required for a2a3.
+            pto_isa_root: Path to PTO-ISA root directory. Required for hardware;
+                simulator builds default to the managed pinned checkout.
             extra_include_dirs: Additional include directories
 
         Returns:
@@ -856,13 +869,11 @@ class KernelCompiler:
         # Build command from toolchain
         cmd = [self.gxx15.cxx_path, *self._sim_incore_compile_flags(core_type)]
 
-        # Add PTO ISA header paths if provided. The path always comes from
-        # ensure_pto_isa_root(), which has already verified HEAD == pto_isa.pin,
-        # so no per-compile re-check is needed here.
-        if pto_isa_root:
-            pto_include = os.path.join(pto_isa_root, "include")
-            pto_pto_include = os.path.join(pto_isa_root, "include", "pto")
-            cmd.extend([f"-I{compiler_visible_path(pto_include)}", f"-I{compiler_visible_path(pto_pto_include)}"])
+        if pto_isa_root is None:
+            pto_isa_root = ensure_pto_isa_root()
+        pto_include = os.path.join(pto_isa_root, "include")
+        pto_pto_include = os.path.join(pto_isa_root, "include", "pto")
+        cmd.extend([f"-I{compiler_visible_path(pto_include)}", f"-I{compiler_visible_path(pto_pto_include)}"])
 
         for inc_dir in self.get_incore_include_dirs():
             cmd.append(f"-I{compiler_visible_path(inc_dir)}")

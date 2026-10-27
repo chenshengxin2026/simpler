@@ -47,6 +47,9 @@ jobs:
         with:
           python-version: ${{ inputs.python_version }}
 
+      - name: Set up C++ compiler
+        uses: ./.github/actions/setup-gcc-15
+
       - name: Install GoogleTest
         if: inputs.setup_variant == 'github' && runner.os == 'Linux'
         uses: ./.github/actions/apt-install

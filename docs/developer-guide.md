@@ -255,6 +255,24 @@ compiler = KernelCompiler(platform="a2a3sim")
 kernel_binary = compiler.compile_incore("path/to/kernel.cpp", core_type="aiv")
 ```
 
+CPU simulator kernels select their PTO instruction family from the platform:
+`a2a3sim` defines `PTO_CPU_SIM_TARGET_A2A3`, and `a5sim` defines
+`PTO_CPU_SIM_TARGET_A5`. Both AIC and AIV compilation force-include
+`pto/cpu/target_config.hpp` from the supplied `pto_isa_root` checkout, or from
+the managed pinned checkout when `pto_isa_root` is omitted. An explicit root
+selects that checkout's headers and ISA revision. The selected family
+controls instruction semantics and the simulator memory profile, without a
+`PTO_CPU_SIM_ARCH` override or an initialization call in the kernel.
+An ISA checkout without this interface fails compilation. Compiler flags,
+compiler logic, and the ISA pin participate in the managed kernel cache keys;
+previous artifacts are rebuilt after the interface or pin changes.
+Each compiled kernel also exports `simpler_cpu_sim_target()` through
+`cpu_sim_target.h`, returning the platform name (`a2a3sim` or `a5sim`).
+The simulator loader checks this marker before resolving
+the kernel entry or registering hooks. It rejects prebuilt kernels from the
+other family, unknown families, and older kernels without a marker; rebuild
+those kernels for the destination platform.
+
 The compiled binaries are packed into a `ChipCallable` (orch SO + each
 child `CoreCallable`) and registered once via
 `DeviceRunner::upload_chip_callable_buffer(callable)`, which fixes up each

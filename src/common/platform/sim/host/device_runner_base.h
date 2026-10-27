@@ -118,6 +118,9 @@ public:
     // (destroy_device_context entrypoint).
     virtual ~SimDeviceRunnerBase() = default;
 
+    // Unspecified runners cannot admit a fixed-family kernel image.
+    virtual const char *cpu_sim_target_family() const { return nullptr; }
+
     // --- Pure / no-op virtuals dispatched from the shared c_api glue ----
     struct PreparedExecution {
         PreparedExecution(

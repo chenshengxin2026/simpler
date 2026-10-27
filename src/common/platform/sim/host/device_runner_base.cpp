@@ -1717,6 +1717,23 @@ uint64_t SimDeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *ca
         }
         dlopen_handles.push_back(handle);
 
+        const char *expected_family = cpu_sim_target_family();
+        auto query_target = reinterpret_cast<const char *(*)()>(dlsym(handle, "simpler_cpu_sim_target"));
+        if (query_target == nullptr) {
+            LOG_ERROR("Child kernel #%d has no CPU simulator target metadata; rebuild it for this platform", i);
+            return 0;
+        }
+        const char *actual_family = query_target();
+        if (expected_family == nullptr || actual_family == nullptr ||
+            std::strcmp(actual_family, expected_family) != 0) {
+            LOG_ERROR(
+                "Child kernel #%d CPU simulator target mismatch: expected '%s', got '%s'; rebuild for this platform", i,
+                expected_family != nullptr ? expected_family : "unspecified",
+                actual_family != nullptr ? actual_family : "unspecified"
+            );
+            return 0;
+        }
+
         void *func = dlsym(handle, "kernel_entry");
         if (!func) {
             LOG_ERROR("dlsym failed for child kernel #%d 'kernel_entry': %s", i, dlerror());

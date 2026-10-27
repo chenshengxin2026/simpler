@@ -190,6 +190,22 @@ def test_sim_target_flag_matches_platform_in_command_and_cache(
     assert command_flags == cache_flags
     assert cache_flags.count(expected_target) == 1
     assert other_target not in cache_flags
+    forced_include = cache_flags.index("-include")
+    assert cache_flags[forced_include + 1] == "pto/cpu/target_config.hpp"
+    assert cache_flags[forced_include + 2 : forced_include + 4] == ["-include", "cpu_sim_target.h"]
+
+
+def test_sim_incore_cache_tracks_isa_pin(monkeypatch):
+    from simpler_setup import kernel_compiler  # noqa: PLC0415
+
+    compiler = kernel_compiler.KernelCompiler("a5sim")
+    monkeypatch.setattr(kernel_compiler, "_executable_cache_identity", lambda path: {"name": path})
+    monkeypatch.setattr(kernel_compiler, "read_pto_isa_pin", lambda: "a" * 40)
+    first = compiler.incore_compile_cache_token("aiv")
+    monkeypatch.setattr(kernel_compiler, "read_pto_isa_pin", lambda: "b" * 40)
+    second = compiler.incore_compile_cache_token("aiv")
+
+    assert first != second
 
 
 def test_compiler_subprocess_runs_from_checkout_root(monkeypatch):

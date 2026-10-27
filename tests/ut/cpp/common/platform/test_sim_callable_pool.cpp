@@ -95,6 +95,7 @@ int sim_bank_free(void *ptr) {
 // accessors read the production pool published by registration.
 class PoolRunner : public SimDeviceRunnerBase {
 public:
+    const char *cpu_sim_target_family() const override { return "a2a3sim"; }
     int prepare_execution(
         Runtime & /*runtime*/, const CallConfig & /*config*/, uint32_t /*pipeline_slot*/,
         const NativeRunIdentity & /*identity*/, std::unique_ptr<PreparedExecution> * /*prepared*/
